@@ -1,0 +1,47 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/ 
+
+# Local object storage
+minio/data/
+minio/minio.exe
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+
+# Ansible
+ansible/inventory.ini
