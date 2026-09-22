@@ -1,0 +1,72 @@
+[
+  {
+    "prid": "2312227",
+    "title": "NHRC, India’s fifth ITEC Executive capacity-building programme on human rights for NHRIs of the Global South concludes in New Delhi",
+    "gold_label": "relevant",
+    "gold_chapter": 57,
+    "reason": "Directly concerns the National Human Rights Commission and its institutional/capacity-building role."
+  },
+  {
+    "prid": "2312513",
+    "title": "Union Minister of State for Cooperation and Civil Aviation Shri Murlidhar Mohol addresses the inauguration ceremony of the new Head Office of Shri Beereshwar Co-operative Credit Society Limited in Belagavi, Karnataka",
+    "gold_label": "relevant",
+    "gold_chapter": 72,
+    "reason": "Directly concerns a multi-state cooperative credit society and the cooperative-sector framework."
+  },
+  {
+    "prid": "2312662",
+    "title": "INDIA - SRI LANKA ANNUAL BILATERAL MARITIME EXERCISE (SLINEX-26)",
+    "gold_label": "relevant",
+    "gold_chapter": 88,
+    "reason": "India-Sri Lanka naval exercise and bilateral maritime cooperation concern foreign policy."
+  },
+  {
+    "prid": "2312096",
+    "title": "From Emotional Distress to Renewed Purpose: Lena's Journey of Recovery",
+    "gold_label": "irrelevant",
+    "gold_chapter": null,
+    "reason": "Individual rehabilitation case; no polity content."
+  },
+  {
+    "prid": "2312204",
+    "title": "AVYAY Strengthens Welfare, Care and Dignified Living for Senior Citizens Across India Institutional Care and State-Specific Support for Senior Citizens",
+    "gold_label": "irrelevant",
+    "gold_chapter": null,
+    "reason": "Senior-citizen welfare programmes; no substantive constitutional/political-system content."
+  },
+  {
+    "prid": "2311551",
+    "title": "Secretary, MSDE inaugurates Skills4Future (Shell India) EV & Green Skills Lab at NSTI Bengaluru",
+    "gold_label": "irrelevant",
+    "gold_chapter": null,
+    "reason": "Government skilling programme; no substantive polity content."
+  },
+  {
+    "prid": "2312067",
+    "title": "Swachh Sagar Surakshit Sagar Has Evolved into a Whole-of-Government, Whole-of-Society Movement for Clean Coasts and Safe Seas: Dr. Jitendra Singh",
+    "gold_label": "irrelevant",
+    "gold_chapter": null,
+    "reason": "Coastal-cleanup/environment campaign; no substantive polity content."
+  },
+  {
+    "prid": "2312179",
+    "title": "Shri Shivraj Singh Chouhan Addresses Southern States Regional Agriculture Conference in Hyderabad, Focuses on Farmers’ Incomes and Agricultural Growth",
+    "gold_label": "borderline",
+    "gold_chapter": 15,
+    "reason": "Centre-State coordination is discussed, but the article is primarily about agriculture policy."
+  },
+  {
+    "prid": "2312271",
+    "title": "Combined Operational Review and Evaluation (CORE) Programme 2026 concludes at Manekshaw Centre, New Delhi",
+    "gold_label": "borderline",
+    "gold_chapter": null,
+    "reason": "Inter-agency national-security coordination is discussed, but there is no direct Laxmikanth chapter match."
+  },
+  {
+    "prid": "2312532",
+    "title": "Biometric Aadhaar Authentication Mandatory for Subsidised Domestic LPG Refills from 1 October 2026",
+    "gold_label": "borderline",
+    "gold_chapter": 8,
+    "reason": "Biometric authentication affects a public benefit and has a possible rights/privacy dimension, but the article does not discuss constitutional rights."
+  }
+]

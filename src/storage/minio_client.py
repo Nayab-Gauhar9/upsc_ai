@@ -5,7 +5,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 from minio import Minio
 from minio.error import S3Error
-import json
 
 
 load_dotenv()
@@ -82,6 +81,51 @@ class MinIOStorage:
         )
 
         return object_name, True
+
+    def upload_classification(self, prid, classification):
+        """Store classification metadata for every processed PIB article."""
+        object_name = f"pib/classifications/{prid}.json"
+
+        if self.object_exists(object_name):
+            return object_name, False
+
+        self.upload_json(object_name, classification)
+        return object_name, True
+
+    def upload_classified_article(self, record, classification, chapter_name):
+        """Store a relevant PIB article under chapter/topic folders."""
+        topic = classification.get("topic") or "Unspecified Topic"
+
+        def safe_path_component(value):
+            value = str(value).strip()
+            value = value.replace("/", "-").replace(chr(92), "-")
+            return value or "Unspecified"
+
+        chapter_dir = safe_path_component(chapter_name)
+        topic_dir = safe_path_component(topic)
+        prid = record["english_prid"]
+
+        object_name = (
+            f"pib/classified/"
+            f"{chapter_dir}/"
+            f"{topic_dir}/"
+            f"{prid}.json"
+        )
+
+        if self.object_exists(object_name):
+            return object_name, False
+
+        data = {
+            **record,
+            "classification": {
+                **classification,
+                "chapter_name": chapter_name,
+            },
+        }
+
+        self.upload_json(object_name, data)
+        return object_name, True
+
     def object_exists(self, object_name):
         try:
             self.client.stat_object(self.bucket, object_name)
