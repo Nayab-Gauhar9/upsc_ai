@@ -154,3 +154,12 @@ class MinIOStorage:
             prefix=prefix,
             recursive=True
         )
+
+    def upload_smart_notes(self, chapter_name, topic, prid, study_intelligence):
+        """Store synthesized UPSC smart notes in MinIO."""
+        def safe_path(val):
+            return str(val).strip().replace("/", "-").replace(chr(92), "-")
+
+        object_name = f"pib/smart_notes/{safe_path(chapter_name)}/{safe_path(topic)}/smart_notes_{prid}.json"
+        self.upload_json(object_name, study_intelligence.model_dump(mode="json"))
+        return object_name
