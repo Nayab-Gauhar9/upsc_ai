@@ -45,3 +45,7 @@ terraform/terraform.tfstate.backup
 
 # Ansible
 ansible/inventory.ini
+
+minio.exe
+ngrok.exe
+srz.zip

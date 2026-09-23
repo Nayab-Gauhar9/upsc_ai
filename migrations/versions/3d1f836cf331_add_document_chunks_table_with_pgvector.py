@@ -30,7 +30,7 @@ def upgrade() -> None:
     sa.Column('chunk_type', sa.String(length=50), nullable=False),
     sa.Column('chunk_text', sa.Text(), nullable=False),
     sa.Column('token_count', sa.Integer(), nullable=True),
-    sa.Column('embedding', Vector(dim=384), nullable=True),
+    sa.Column('embedding', Vector(dim=4096), nullable=True),
     sa.Column('embedding_model', sa.String(length=100), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )

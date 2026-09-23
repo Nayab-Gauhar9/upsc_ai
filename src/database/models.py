@@ -123,11 +123,11 @@ class DocumentChunkModel(Base):
     )
 
     embedding = mapped_column(
-        Vector(384),  # Dimensions for sentence-transformers all-MiniLM-L6-v2
+        Vector(4096),  # Dimensions for sentence-transformers all-MiniLM-L6-v2
         nullable=True,
     )
 
     embedding_model: Mapped[str] = mapped_column(
         String(100),
-        default="all-MiniLM-L6-v2",
+        default="qwen3-embedding",
     )
