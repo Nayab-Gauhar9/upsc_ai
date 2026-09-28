@@ -50,3 +50,4 @@ minio.exe
 ngrok.exe
 srz.zip
 celerybeat-schedule*
+pgvector/
