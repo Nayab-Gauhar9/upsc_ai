@@ -2,7 +2,7 @@ import time
 from src.classifiers.llm import LangChainGroqClassifier
 from src.classifiers.taxonomy import LAXMIKANTH_8TH_EDITION
 from src.storage.minio_client import MinIOStorage
-
+from src.celery.llm_rotator import execute_with_key_failover
 
 class PIBClassificationPipeline:
     """Classify unprocessed PIB articles and materialize relevant articles."""
@@ -73,6 +73,14 @@ class PIBClassificationPipeline:
 
         # No classification marker: process with LLM via Groq
         print(f" -> Calling Groq LLM...")
+        def _invoke_classifier(record, api_key=None):
+            if api_key:
+                # Dynamically set active key on the classifier's client if supported:
+                if hasattr(self.classifier, "client") and hasattr(self.classifier.client, "api_key"):
+                    self.classifier.client.api_key = api_key
+            return self.classifier.classify(record)
+
+
         result = self.classifier.classify(record)
 
         classification = self._build_classification(
@@ -174,4 +182,4 @@ class PIBClassificationPipeline:
 if __name__ == "__main__":
     pipeline = PIBClassificationPipeline()
     # Runs with a limit of 10 for safe inspection, change or remove limit=10 as needed
-    pipeline.process_all(limit=30)
+    pipeline.process_all()

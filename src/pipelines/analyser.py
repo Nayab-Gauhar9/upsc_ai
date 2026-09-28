@@ -1,6 +1,6 @@
-
 import time
 from typing import Optional
+from src.celery.llm_rotator import execute_with_key_failover
 from src.analyser.study_llm import UPSCStudySynthesizer
 from src.storage.minio_client import MinIOStorage
 
@@ -11,6 +11,17 @@ class StudySynthesisPipeline:
     def __init__(self):
         self.storage = MinIOStorage()
         self.synthesizer = UPSCStudySynthesizer()
+
+    def _invoke_synthesizer(self, chapter_name, topic, record, api_key=None):
+        """Helper to invoke synthesis while dynamically switching API keys."""
+        if api_key:
+            if hasattr(self.synthesizer, "client") and hasattr(self.synthesizer.client, "api_key"):
+                self.synthesizer.client.api_key = api_key
+        return self.synthesizer.synthesize(
+            chapter_name=chapter_name,
+            topic=topic,
+            record=record,
+        )
 
     def process_all_relevant(self, limit: Optional[int] = None, delay_between_calls: float = 20.0):
         """
@@ -66,11 +77,12 @@ class StudySynthesisPipeline:
                 if not record:
                     record = payload
 
-                # Invoke Groq LLM for study intelligence
-                study_result = self.synthesizer.synthesize(
-                    chapter_name=chapter_name,
-                    topic=topic,
-                    record=record,
+                # Invoke Groq LLM with key failover rotation
+                study_result = execute_with_key_failover(
+                    self._invoke_synthesizer,
+                    chapter_name,
+                    topic,
+                    record,
                 )
 
                 # Save smart notes back into MinIO
@@ -120,5 +132,4 @@ class StudySynthesisPipeline:
 
 if __name__ == "__main__":
     pipeline = StudySynthesisPipeline()
-    # Test on a small batch of 2 first to inspect rich terminal outputs
-    pipeline.process_all_relevant(limit=10)
+    pipeline.process_all_relevant()

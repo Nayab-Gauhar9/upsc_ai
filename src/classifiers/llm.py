@@ -17,7 +17,7 @@ load_dotenv()
 class LangChainGroqClassifier(ArticleClassifier):
     PROVIDER = "groq"
     MODEL = "openai/gpt-oss-120b"
-    MAX_TOKENS = 2048
+    MAX_TOKENS = 3000
 
     def __init__(
         self,
