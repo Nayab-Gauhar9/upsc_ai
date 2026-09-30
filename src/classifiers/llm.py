@@ -72,23 +72,38 @@ class LangChainGroqClassifier(ArticleClassifier):
             for number, name in LAXMIKANTH_8TH_EDITION.items()
         )
 
-    def classify(self, record: Dict[str, Any]) -> ClassificationResult:
-        chapters = self._chapter_text()
-        title = record.get("title", "")
-        article_text = record.get("article_text", "") or record.get("content", "")
+    def classify(
+        self, record: Dict[str, Any], api_key: Optional[str] = None
+    ) -> ClassificationResult:
+      chapters = self._chapter_text()
+      title = record.get("title", "")
+      article_text = record.get("article_text", "") or record.get("content", "")
 
-        # Invoke the LCEL chain with exact prompt variables matching hf.py
-        result: ClassificationResult = self.chain.invoke({
-            "chapters": chapters,
-            "title": title,
-            "article_text": article_text,
-        })
+      # Select chain: use rotated key if provided, else fall back to default chain
+      if api_key and api_key != self.api_key:
+        active_llm = ChatGroq(
+            model=self.MODEL,
+            api_key=api_key,
+            temperature=self.llm.temperature,
+            max_tokens=self.MAX_TOKENS,
+        )
+        active_chain = (
+            self.prompt | active_llm.with_structured_output(ClassificationResult)
+        )
+      else:
+        active_chain = self.chain
 
-        # Ensure timestamp alignment
-        if result.classified_at is None:
-            result.classified_at = datetime.now(timezone.utc)
+      # Invoke the LCEL chain
+      result: ClassificationResult = active_chain.invoke({
+          "chapters": chapters,
+          "title": title,
+          "article_text": article_text,
+      })
 
-        return result
+      if result.classified_at is None:
+        result.classified_at = datetime.now(timezone.utc)
+
+      return result
 
     def classify_batch(
         self, items: List[Dict[str, Any]], max_concurrency: int = 2

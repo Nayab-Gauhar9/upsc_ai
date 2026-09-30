@@ -33,6 +33,7 @@ def get_available_key() -> str | None:
     for _ in range(total_keys):
         # Rotate key atomically: move tail item to head
         key = redis_client.rpoplpush(KEY_POOL_LIST, KEY_POOL_LIST)
+        print(f"[ROUND-ROBIN] Dispatched Key: ...{key[-6:]}")
         
         # Check if key is currently rate-limited/in cooldown
         cooldown_key = f"{COOLDOWN_PREFIX}{key[-8:]}"
@@ -47,3 +48,9 @@ def mark_key_rate_limited(key: str, cooldown_seconds: int = 60):
     key_tag = key[-8:]
     redis_client.set(f"{COOLDOWN_PREFIX}{key_tag}", "rate_limited", ex=cooldown_seconds)
     print(f"Key ending with '...{key_tag}' marked in cooldown for {cooldown_seconds}s.")
+
+raw_keys = os.getenv("GROQ_API_KEYS", "")
+GROQ_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
+
+if GROQ_KEYS:
+  init_api_key_pool(GROQ_KEYS)

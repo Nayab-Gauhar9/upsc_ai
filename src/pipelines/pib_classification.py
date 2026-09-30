@@ -74,14 +74,10 @@ class PIBClassificationPipeline:
         # No classification marker: process with LLM via Groq
         print(f" -> Calling Groq LLM...")
         def _invoke_classifier(record, api_key=None):
-            if api_key:
-                # Dynamically set active key on the classifier's client if supported:
-                if hasattr(self.classifier, "client") and hasattr(self.classifier.client, "api_key"):
-                    self.classifier.client.api_key = api_key
-            return self.classifier.classify(record)
+            return self.classifier.classify(record, api_key=api_key)
 
 
-        result = self.classifier.classify(record)
+        result = execute_with_key_failover(_invoke_classifier, record)
 
         classification = self._build_classification(
             record,
