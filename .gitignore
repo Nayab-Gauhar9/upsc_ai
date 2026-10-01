@@ -51,3 +51,4 @@ ngrok.exe
 srz.zip
 celerybeat-schedule*
 pgvector/
+.venv_wsl/

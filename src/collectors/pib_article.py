@@ -142,20 +142,23 @@ def resolve_article(prid):
 
 
 def extract_basic_metadata(soup):
-
     title = None
     published_text = None
 
-    # Article title
-    heading = soup.find("h2")
-
-    if heading:
-        title = heading.get_text(" ", strip=True)
+    # Check headers with non-empty text, prioritizing h2 then h3
+    for tag_name in ["h2", "h3", "h4"]:
+        for el in soup.find_all(tag_name):
+            text = el.get_text(" ", strip=True)
+            if text:
+                title = " ".join(text.split())
+                break
+        if title:
+            break
 
     # Publication date
-    date_element = soup.find(id ="PrDateTime")
+    date_element = soup.find(id="PrDateTime")
     if date_element:
-        published_text= " ".join(date_element.get_text(" ", strip=True).split())
+        published_text = " ".join(date_element.get_text(" ", strip=True).split())
 
     return {
         "title": title,
@@ -212,20 +215,16 @@ def extract_article_content(soup):
 
     return article_text
 
-def collect_article(prid):
-
+def collect_article(prid, fallback_title=None):
     result = resolve_article(prid)
 
     if result["soup"] is None:
         return None
 
-    metadata = extract_basic_metadata(
-        result["soup"]
-    )
+    metadata = extract_basic_metadata(result["soup"])
+    article = extract_article_content(result["soup"])
 
-    article = extract_article_content(
-        result["soup"]
-    )
+    final_title = metadata["title"] or fallback_title
 
     return {
         "source": "PIB",
@@ -233,7 +232,7 @@ def collect_article(prid):
         "source_language": result["language"],
         "english_prid": result["english_prid"],
         "url": result["english_url"],
-        "title": metadata["title"],
+        "title": final_title,
         "published_at": metadata["published_at"],
         "article_text": article
     }

@@ -74,7 +74,7 @@ def run_pib_ingestion(limit=None):
 
             try:
 
-                record = collect_article(prid)
+                record = collect_article(prid, fallback_title=item.get("title"))
 
                 if record is None:
                     failed += 1
