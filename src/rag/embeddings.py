@@ -1,17 +1,21 @@
-import ollama
+import os
+import time
 from typing import List, Dict, Any
+import voyageai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class UPSCChunkerAndEmbedder:
-    def __init__(self, model_name: str = "qwen3-embedding"):
-        print(f"Using local Ollama embedding model '{model_name}'...")
+    def __init__(self, model_name: str = "voyage-3-large"):
         self.model_name = model_name
-        # Note: Set embedding dimension based on your Ollama model specs (e.g., 1536 or 1024)
-        self.embedding_dim = 1536 
+        self.embedding_dim = 1024  # voyage-3 defaults to 1024 dimensions
+        self.client = voyageai.Client(api_key=os.getenv("VOYAGE_API_KEY"))
 
     def chunk_smart_notes(self, smart_notes_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Breaks down a smart notes record into comprehensive semantic chunks 
-        covering every field for robust vector search retrieval via Ollama.
+        covering every field for vector search retrieval.
         """
         chunks = []
         
@@ -54,7 +58,7 @@ class UPSCChunkerAndEmbedder:
             chunks.append({
                 "chunk_type": "smart_note_bullet",
                 "text": note_text,
-                "token_count": len(note_text.split())
+                "token_count": len(str(note).split())
             })
 
         # 5. Prelims Practice Points Chunks
@@ -72,10 +76,25 @@ class UPSCChunkerAndEmbedder:
 
         return chunks
 
-    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generates dense vector embeddings locally using Ollama's embed API."""
-        response = ollama.embed(
+    def generate_embeddings(
+        self, texts: List[str], input_type: str = "document", delay_seconds: float = 0.0
+    ) -> List[List[float]]:
+        """
+        Generates dense 1024-dim vector embeddings via Voyage AI.
+        input_type='document' optimizes for stored passages.
+        input_type='query' optimizes for user questions.
+        """
+        if not texts:
+            return []
+
+        response = self.client.embed(
+            texts=texts,
             model=self.model_name,
-            input=texts
+            input_type=input_type,
+            truncation=True
         )
-        return response['embeddings']
+
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+        return response.embeddings

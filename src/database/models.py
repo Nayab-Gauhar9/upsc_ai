@@ -122,10 +122,10 @@ class DocumentChunkModel(Base):
         nullable=True,
     )
 
-    embedding = mapped_column(
-        Vector(4096),  # Dimensions for sentence-transformers all-MiniLM-L6-v2
-        nullable=True,
-    )
+    embedding_1024 = mapped_column(
+            Vector(1024),  
+            nullable=True,
+        )
 
     embedding_model: Mapped[str] = mapped_column(
         String(100),

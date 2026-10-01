@@ -1,4 +1,4 @@
-
+import time
 from src.rag.embeddings import UPSCChunkerAndEmbedder
 from src.storage.minio_client import MinIOStorage
 from src.database.session import SessionLocal
@@ -8,7 +8,7 @@ from src.database.models import DocumentChunkModel
 class VectorIngestionPipeline:
     def __init__(self):
         self.storage = MinIOStorage()
-        self.embedder = UPSCChunkerAndEmbedder()
+        self.embedder = UPSCChunkerAndEmbedder(model_name="voyage-3-large")
 
     def process_all_smart_notes(self, limit=None):
         objects = list(self.storage.list_objects("pib/smart_notes/"))
@@ -34,48 +34,41 @@ class VectorIngestionPipeline:
                 filename = parts[4]
                 prid = filename.replace("smart_notes_", "").replace(".json", "")
 
-                # Check if this PRID has already been embedded and stored in the database
-                existing_chunks_count = (
+                # Skip if already ingested
+                already_ingested = (
                     db.query(DocumentChunkModel)
                     .filter(DocumentChunkModel.prid == prid)
-                    .count()
+                    .first()
                 )
-
-                if existing_chunks_count > 0:
-                    print(f"[-] Skipping PRID: {prid} (Already exists in database for '{chapter_name} -> {topic}')")
+                if already_ingested:
+                    print(f"[-] Skipping PRID: {prid} (Already exists in database)")
                     continue
 
                 print("\n" + "=" * 60)
-                print(f"[+] PROCESSING NEW ARTICLE")
+                print(f"[+] PROCESSING ARTICLE")
                 print(f"    PRID         : {prid}")
                 print(f"    Chapter      : {chapter_name}")
                 print(f"    Topic        : {topic}")
-                print(f"    MinIO Object : {object_name}")
+                print(f"    Object Key   : {object_name}")
                 print("=" * 60)
 
-                # Fetch smart notes json from MinIO
                 smart_notes_data = self.storage.get_json(object_name)
                 if not smart_notes_data:
-                    print(f"[!] Warning: Empty or unreadable JSON for PRID {prid}")
+                    print(f"[!] Warning: Empty JSON for PRID {prid}")
                     continue
 
-                # Print summary details if available in json
-                if isinstance(smart_notes_data, dict):
-                    print(f"    Title        : {smart_notes_data.get('title', 'N/A')}")
-                    print(f"    Ministry     : {smart_notes_data.get('ministry', 'N/A')}")
-
-                # Break down into semantic chunks
                 chunks = self.embedder.chunk_smart_notes(smart_notes_data)
                 if not chunks:
                     print(f"[!] Warning: No chunks generated for PRID {prid}")
                     continue
 
-                print(f"    Generated    : {len(chunks)} semantic chunks. Generating embeddings...")
+                print(f"    Generated    : {len(chunks)} chunks. Calling Voyage AI...")
 
+                # Single batch call for all chunks in this article
                 texts = [c["text"] for c in chunks]
-                embeddings = self.embedder.generate_embeddings(texts)
+                embeddings = self.embedder.generate_embeddings(texts, input_type="document")
 
-                # Store chunks and vectors into PostgreSQL pgvector table
+                # Insert clean chunks with 1024-dim vectors
                 for chunk, embedding in zip(chunks, embeddings):
                     db_chunk = DocumentChunkModel(
                         prid=prid,
@@ -84,20 +77,24 @@ class VectorIngestionPipeline:
                         chunk_type=chunk["chunk_type"],
                         chunk_text=chunk["text"],
                         token_count=chunk["token_count"],
-                        embedding=embedding,
-                        embedding_model="qwen3-8b",
+                        embedding_1024=embedding,
+                        embedding_model="voyage-3-large",
                     )
                     db.add(db_chunk)
 
+                db.commit()
                 processed_count += 1
-                print(f"[SUCCESS] Stored PRID {prid} with {len(chunks)} chunks into pgvector.\n")
+                print(f"[SUCCESS] Ingested {len(chunks)} chunks for PRID {prid}.")
 
-            db.commit()
-            print(f"[COMPLETED] Total new files embedded and saved in this run: {processed_count}")
+                # Voyage rate limiter: 25s pause maintains ~2.4 RPM (< 3 RPM limit)
+                print("Pausing 25s to respect Voyage AI free rate limit...")
+                time.sleep(30)
+
+            print(f"\n[COMPLETED] Ingestion complete. Processed {processed_count} files.")
 
         except Exception as e:
             db.rollback()
-            print(f"[ERROR] Vector ingestion failed: {e}")
+            print(f"[ERROR] Ingestion failed: {e}")
             raise
         finally:
             db.close()
@@ -105,5 +102,5 @@ class VectorIngestionPipeline:
 
 if __name__ == "__main__":
     pipeline = VectorIngestionPipeline()
-    # Set limit=None to process all new files, or a number like 1 or 2 for testing
-    pipeline.process_all_smart_notes(limit=10)
+    # Test with 2 articles first, then run with limit=None
+    pipeline.process_all_smart_notes(limit=25)
