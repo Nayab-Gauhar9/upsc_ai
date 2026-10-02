@@ -5,7 +5,7 @@ from src.storage.minio_client import MinIOStorage
 from src.rag.embeddings import UPSCChunkerAndEmbedder
 
 class UPSCRetriever:
-    def init(self):
+    def __init__(self):
         # Do not persist a single session on self
         self.embedder = UPSCChunkerAndEmbedder(model_name="voyage-3-large")
         self.storage = MinIOStorage()
