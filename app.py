@@ -23,6 +23,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 retriever = UPSCRetriever()
 generator = UPSCRAGGenerator(model_name="openai/gpt-oss-120b")
@@ -32,6 +35,9 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

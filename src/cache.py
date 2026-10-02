@@ -14,15 +14,17 @@ try:
             redis_url,
             decode_responses=True,
             socket_connect_timeout=2,
+            protocol=2,
         )
     else:
         # Fallback to local host & port
         redis_client = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
-            port=int(os.getenv("REDIS_PORT", 6379)),
+            port=int(os.getenv("REDIS_PORT", 6380)),
             db=int(os.getenv("REDIS_DB", 0)),
             decode_responses=True,
             socket_connect_timeout=1,
+            protocol=2,
         )
 except Exception as e:
     print(f"[CACHE INIT WARNING] Failed to initialize Redis: {e}")
