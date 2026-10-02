@@ -5,8 +5,8 @@ from src.storage.minio_client import MinIOStorage
 from src.rag.embeddings import UPSCChunkerAndEmbedder
 
 class UPSCRetriever:
-    def __init__(self):
-        self.db = SessionLocal()
+    def init(self):
+        # Do not persist a single session on self
         self.embedder = UPSCChunkerAndEmbedder(model_name="voyage-3-large")
         self.storage = MinIOStorage()
 
@@ -20,14 +20,21 @@ class UPSCRetriever:
             return []
         query_embedding = query_embeddings[0]
 
-        # 2. Query pgvector against the 1024-dim column
-        chunks = (
-            self.db.query(DocumentChunkModel)
-            .filter(DocumentChunkModel.embedding_1024.isnot(None))
-            .order_by(DocumentChunkModel.embedding_1024.cosine_distance(query_embedding))
-            .limit(top_k * 3)
-            .all()
-        )
+        # 2. Query pgvector against the 1024-dim column with managed session lifecycle
+        db = SessionLocal()
+        try:
+            chunks = (
+                db.query(DocumentChunkModel)
+                .filter(DocumentChunkModel.embedding_1024.isnot(None))
+                .order_by(DocumentChunkModel.embedding_1024.cosine_distance(query_embedding))
+                .limit(top_k * 3)
+                .all()
+            )
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
         seen_prids = set()
         resolved_articles = []
