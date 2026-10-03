@@ -6,8 +6,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from minio import Minio
 from minio.error import S3Error
-
-
+import re
+from typing import Any
 load_dotenv()
 
 def is_local_minio_alive(host: str = "127.0.0.1", port: int = 9000, timeout: float = 0.5) -> bool:
@@ -200,3 +200,60 @@ class MinIOStorage:
         object_name = f"pib/smart_notes/{safe_path(chapter_name)}/{safe_path(topic)}/smart_notes_{prid}.json"
         self.upload_json(object_name, study_intelligence.model_dump(mode="json"))
         return object_name
+
+    def list_latest_smart_notes(self, limit: int = 5) -> list:
+        bucket = "upsc-ai"
+        prefix = "pib/smart_notes/"
+        pattern = re.compile(r"pib/smart_notes/([^/]+)/([^/]+)/smart_notes_(\d+)\.json")
+        matched_keys = []
+
+        try:
+            # 1. MinIO Python SDK listing
+            objects = self.client.list_objects(bucket, prefix=prefix, recursive=True)
+            for obj in objects:
+                key = getattr(obj, "object_name", str(obj))
+                match = pattern.search(key)
+                if match:
+                    matched_keys.append({
+                        "prid": int(match.group(3)),
+                        "chapter": match.group(1).strip(),
+                        "topic": match.group(2).strip(),
+                        "key": key
+                    })
+        except Exception as e:
+            print(f"Error listing objects from {bucket}: {e}")
+            return []
+
+        # 2. Sort descending: highest PRID = latest
+        matched_keys.sort(key=lambda x: x["prid"], reverse=True)
+
+        # 3. Read the JSON metadata for the top items
+        latest_notes = []
+        for item in matched_keys[:limit]:
+            try:
+                data = self.get_json(item["key"])
+                latest_notes.append({
+                    "prid": item["prid"],
+                    "chapter": item["chapter"],
+                    "topic": item["topic"],
+                    "headline": data.get("headline", item["topic"]),
+                    "summary": data.get("summary", ""),
+                    "generated_at": data.get("generated_at", ""),
+                    "object_key": item["key"],
+                    "smart_notes": data
+                })
+            except Exception as read_err:
+                print(f"Failed to fetch content for {item['key']}: {read_err}")
+
+        return latest_notes
+
+    def upload_smart_notes(self, chapter_name: str, topic: str, prid: Any, study_intelligence: Any) -> str:
+            """Serializes and persists synthesized smart notes JSON to R2/MinIO."""
+            def safe_path(val):
+                return str(val).strip().replace("/", "-").replace(chr(92), "-")
+
+            object_name = f"pib/smart_notes/{safe_path(chapter_name)}/{safe_path(topic)}/smart_notes_{prid}.json"
+            
+            data = study_intelligence.model_dump(mode="json") if hasattr(study_intelligence, "model_dump") else study_intelligence
+            self.upload_json(object_name, data)
+            return object_name

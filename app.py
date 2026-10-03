@@ -27,6 +27,22 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
+@app.get("/api/notes/latest")
+def get_latest_note():
+    """
+    Returns only the single most recently added smart note for guest promotion.
+    """
+    try:
+        notes = retriever.storage.list_latest_smart_notes(limit=1)
+        if not notes:
+            return {"status": "empty", "note": None}
+        return {
+            "status": "success",
+            "note": notes[0]  # Return just the top single note object
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 retriever = UPSCRetriever()
 generator = UPSCRAGGenerator(model_name="openai/gpt-oss-120b")
 
@@ -648,6 +664,149 @@ async def delete_user_note(
     return {"status": "success", "message": f"Note {note_id} deleted"}
 
 
+class SaveSmartNoteToWorkspaceRequest(BaseModel):
+    firebase_uid: str
+    object_key: str
+    category: Optional[str] = "Current Affairs GS-II"
+    custom_reflection: Optional[str] = None
+
+@app.post("/api/notes/save-smart-note")
+async def save_smart_note_to_workspace(
+    payload: SaveSmartNoteToWorkspaceRequest, 
+    db: Session = Depends(get_db)
+):
+    """
+    Imports a PIB Smart Note from MinIO directly into the user's personal UserNote list.
+    """
+    # 1. Verify user exists
+    user = db.query(User).filter(User.firebase_uid == payload.firebase_uid).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 2. Fetch the smart note content from MinIO
+    try:
+        raw_data = storage.get_json(payload.object_key)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load smart note from storage: {e}")
+
+    headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Note"
+
+    # 3. Check if the user already saved this note (by title match)
+    existing = (
+        db.query(UserNote)
+        .filter(UserNote.user_id == user.id, UserNote.title == headline)
+        .first()
+    )
+    if existing:
+        return {
+            "status": "success",
+            "message": "Note already exists in your workspace",
+            "note_id": existing.id
+        }
+
+    # 4. Generate structured markdown note content
+    note_lines = [
+        f"# {headline}\n",
+        f"Source: PIB Reference | {payload.object_key}\n"
+    ]
+
+    if payload.custom_reflection:
+        note_lines.append(f"### 💡 My Revision Notes / Reflections\n{payload.custom_reflection}\n")
+
+    if raw_data.get("summary"):
+        note_lines.append(f"### 📌 Executive Summary\n{raw_data['summary']}\n")
+
+    smart_notes = raw_data.get("smart_notes")
+    if isinstance(smart_notes, list) and smart_notes:
+        note_lines.append("### 📝 Key Analysis & Takeaways")
+        for pt in smart_notes:
+            note_lines.append(f"* {pt}")
+        note_lines.append("")
+
+    linkages = raw_data.get("backward_linkages")
+    if isinstance(linkages, list) and linkages:
+        note_lines.append("### 🔗 Backward Linkages (Static Polity & Cases)")
+        for item in linkages:
+            note_lines.append(f"* {item}")
+        note_lines.append("")
+
+    if raw_data.get("mains_question"):
+        note_lines.append(f"### ✍️ Mains Analytical Question\n> {raw_data['mains_question']}\n")
+
+    formatted_content = "\n".join(note_lines)
+
+    # 5. Insert into existing UserNote table
+    new_note = UserNote(
+        user_id=user.id,
+        title=headline,
+        content=formatted_content,
+        category=payload.category or "Current Affairs GS-II",
+    )
+    db.add(new_note)
+    db.commit()
+    db.refresh(new_note)
+
+    return {
+        "status": "success",
+        "message": "Saved to personal workspace",
+        "note_id": new_note.id
+    }
+
+from fastapi.responses import StreamingResponse
+import urllib.parse
+from src.services.pdf_generator import generate_pdf_from_markdown
+
+@app.get("/api/current-affairs/download-pdf")
+async def download_smart_note_pdf(object_key: str = Query(..., description="MinIO object key")):
+    """Generates and streams a downloadable PDF for any smart note directly from MinIO."""
+    # Reuse your existing get_ca_note_content logic
+    note_data = get_ca_note_content(object_key=object_key)
+    title = note_data.get("title", "UPSC_Smart_Note")
+    markdown_text = note_data.get("markdown", "")
+
+    pdf_stream = generate_pdf_from_markdown(title=title, markdown_content=markdown_text)
+
+    safe_filename = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).rstrip()
+    encoded_filename = urllib.parse.quote(f"{safe_filename[:40]}.pdf")
+
+    return StreamingResponse(
+        pdf_stream,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"
+        }
+    )
+
+@app.get("/api/notes/{note_id}/download-pdf")
+async def download_user_note_pdf(
+    note_id: int, 
+    firebase_uid: str = Query(...), 
+    db: Session = Depends(get_db)
+):
+    """Generates and streams a downloadable PDF from a saved UserNote."""
+    user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    note = db.query(UserNote).filter(UserNote.id == note_id, UserNote.user_id == user.id).first()
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    pdf_stream = generate_pdf_from_markdown(title=note.title, markdown_content=note.content)
+
+    safe_filename = "".join(c for c in note.title if c.isalnum() or c in (" ", "_", "-")).rstrip()
+    encoded_filename = urllib.parse.quote(f"{safe_filename[:40]}.pdf")
+
+    return StreamingResponse(
+        pdf_stream,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"
+        }
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+
