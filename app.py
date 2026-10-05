@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -6,45 +6,242 @@ from sqlalchemy.orm import Session
 from src.storage.minio_client import MinIOStorage
 from src.classifiers.taxonomy import LAXMIKANTH_8TH_EDITION, CHAPTER_BY_TITLE
 from src.database.session import SessionLocal
-from src.database.models import User, UserQueryHistory, UserChapterProgress, UserNote
+from src.database.models import User, UserQueryHistory, UserChapterProgress, UserNote, IssueDossierModel, IssueGraphEdgeModel
 from src.rag.retriever import UPSCRetriever
 from src.pipelines.rag_generator import UPSCRAGGenerator
-from src.cache import get_cached_chapter, set_cached_chapter
 from datetime import datetime
+import os
+from dotenv import load_dotenv
+load_dotenv()
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import secrets
+from src.cache import get_cached_chapter, get_cached_json, set_cached_chapter, set_cached_json
+from sqlalchemy import or_, select
+from sqlalchemy.orm import selectinload
 
 storage = MinIOStorage()
+
+retriever = UPSCRetriever()
+generator = UPSCRAGGenerator(model_name="openai/gpt-oss-120b")
 SMART_NOTES_PREFIX = "pib/smart_notes/"
-app = FastAPI(title="UPSC AI Mentor API")
+
+def fetch_quality_gated_dossiers(
+    query_str: str,
+    db: Session,
+    min_keyword_match_ratio: float = 0.65,
+    max_dossiers: int = 3
+) -> list:
+    """
+    Dynamically fetches dossiers only if they cross the relevance threshold.
+    Incorporates more if relevant, ignores if low match.
+    """
+    stopwords = {"what", "when", "where", "which", "with", "from", "that", "this", "explain", "analyze", "evaluate", "discuss"}
+    query_terms = [
+        w.lower().strip() for w in query_str.split() 
+        if len(w) > 3 and w.lower().strip() not in stopwords
+    ]
+    if not query_terms:
+        return []
+
+    # Build SQL ILIKE clauses across terms
+    conditions = []
+    for term in query_terms:
+        pattern = f"%{term}%"
+        conditions.append(IssueDossierModel.issue_slug.ilike(pattern))
+        conditions.append(IssueDossierModel.title.ilike(pattern))
+        conditions.append(IssueDossierModel.canonical_summary.ilike(pattern))
+
+    stmt = (
+        select(IssueDossierModel)
+        .where(or_(*conditions))
+        .options(selectinload(IssueDossierModel.edges))
+        .order_by(IssueDossierModel.last_updated_at.desc())
+        .limit(10)
+    )
+
+    candidates = db.scalars(stmt).all()
+    scored_dossiers = []
+
+    for d in candidates:
+        text_corpus = f"{d.issue_slug} {d.title} {d.canonical_summary or ''}".lower()
+        matched_terms = [t for t in query_terms if t in text_corpus]
+        match_ratio = len(matched_terms) / len(query_terms)
+
+        # STRICT QUALITY FILTER: Ignore if below threshold
+        if match_ratio >= min_keyword_match_ratio:
+            scored_dossiers.append((match_ratio, d))
+
+    # Sort descending by match quality
+    scored_dossiers.sort(key=lambda x: x[0], reverse=True)
+
+    # Format selected high-quality dossiers
+    selected_contexts = []
+    for score, d in scored_dossiers[:max_dossiers]:
+        perspectives = [
+            f"[{e.publication.upper()} | {e.event_date}]: {e.core_claim}"
+            for e in d.edges[:4]
+        ]
+        body_dim = d.mains_framework.get("body_dimensions", "") if d.mains_framework else ""
+        way_forward = d.mains_framework.get("way_forward_reforms", "") if d.mains_framework else ""
+
+        content_text = f"""
+--- LIVING CONSTITUTIONAL DOSSIER: {d.title} (Match Confidence: {round(score * 100)}%) ---
+Chapter: {d.chapter_name} | Status: {d.status.upper()} | Perspectives Synthesized: {d.article_count}
+Canonical Synthesis:
+{d.canonical_summary}
+
+Dialectical Dimensions:
+{body_dim}
+
+Key Evolutionary Perspectives:
+{chr(10).join(perspectives)}
+
+Way Forward:
+{way_forward}
+------------------------------------------------
+"""
+        selected_contexts.append({
+            "prid": d.issue_slug,  # Fixes KeyError: 'prid'
+            "headline": f"Master Topic Dossier: {d.title}",
+            "title": d.title,
+            "summary": d.canonical_summary,
+            "content": content_text,
+            "text": content_text,  # Fallback for generators accessing article['text']
+            "source": "Evolving Topic Dossier (Multi-Source)",
+            "source_type": "dossier",
+            "chapter": d.chapter_name,
+            "issue_slug": d.issue_slug,
+            "relevance_score": score,
+        })
+
+    return selected_contexts
+
+def filter_quality_pib_notes(notes: list, min_score: float = 0.45) -> list:
+    """Drops noise and retains solid topical PIB matches."""
+    if not notes:
+        return []
+    
+    quality_notes = []
+    for item in notes:
+        # Check all possible score keys including similarity_score
+        score = (
+            item.get("similarity_score")
+            or item.get("score")
+            or item.get("similarity")
+            or item.get("distance_score")
+        )
+        
+        # If score is present, enforce the 0.45 threshold
+        if score is not None:
+            if float(score) >= min_score:
+                quality_notes.append(item)
+        else:
+            # Fallback if no score was attached
+            quality_notes.append(item)
+            
+    return quality_notes
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return get_remote_address(request)
+
+# Initialize Limiter
+limiter = Limiter(key_func=get_client_ip)
+
+app = FastAPI(
+    title="UPSC AI Mentor API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+security = HTTPBasic()
+
+DOCS_USERNAME = os.getenv("DOCS_USERNAME", "admin")
+DOCS_PASSWORD = os.getenv("DOCS_PASSWORD", "")
+
+def verify_docs_access(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, DOCS_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, DOCS_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+# 2. Authenticated Swagger UI route
+@app.get("/docs", include_in_schema=False)
+async def get_documentation(auth: None = Depends(verify_docs_access)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="Polity Mentor API Docs")
+
+# 3. Authenticated OpenAPI schema route
+@app.get("/openapi.json", include_in_schema=False)
+async def openapi_endpoint(auth: None = Depends(verify_docs_access)):
+    return get_openapi(title="UPSC AI Mentor API", version="1.0.0", routes=app.routes)
+
+# Register Limiter on App State and Error Handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+ALLOWED_ORIGINS = [
+    "https://politymentor.com",
+    "https://www.politymentor.com",
+    "https://app.flutterflow.io",
+    "https://preview.flutterflow.io",
+]
+
+ORIGIN_REGEX = (
+    r"^(https://.*\.ngrok-free\.app"
+    r"|https://.*\.ngrok-free\.dev"
+    r"|https://.*\.ngrok\.io"
+    r"|https://.*\.onrender\.com"
+    r"|http://localhost(:\d+)?"
+    r"|http://127\.0\.0\.1(:\d+)?)$"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/health")
+app.add_middleware(SlowAPIMiddleware)
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok"}
 
 @app.get("/api/notes/latest")
 def get_latest_note():
-    """
-    Returns only the single most recently added smart note for guest promotion.
-    """
+    cache_key = "ca:notes:latest"
+    cached = get_cached_json(cache_key)
+    if cached:
+        return cached
+
     try:
         notes = retriever.storage.list_latest_smart_notes(limit=1)
         if not notes:
             return {"status": "empty", "note": None}
-        return {
+        
+        response = {
             "status": "success",
-            "note": notes[0]  # Return just the top single note object
+            "note": notes[0]
         }
+        set_cached_json(cache_key, response, ex_seconds=600)  # 10 minutes
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-retriever = UPSCRetriever()
-generator = UPSCRAGGenerator(model_name="openai/gpt-oss-120b")
 
 # Database session dependency
 def get_db():
@@ -73,7 +270,7 @@ class SearchRequest(BaseModel):
 class GenerateRequest(BaseModel):
     question: str
     top_k: int = 3
-    firebase_uid: Optional[str] = None
+    firebase_uid:str
 
 class ChapterStudyRequest(BaseModel):
     chapter_id: Optional[int] = None
@@ -132,42 +329,130 @@ async def sync_firebase_user(payload: UserSyncRequest, db: Session = Depends(get
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/rag/search")
-async def search_notes(payload: SearchRequest):
-    try:
-        results = retriever.retrieve_smart_notes_for_query(payload.query, top_k=payload.top_k)
-        return {"status": "success", "data": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def search_notes(payload: SearchRequest, db: Session = Depends(get_db)):
+  try:
+    dossiers = fetch_quality_gated_dossiers(query_str=payload.query, db=db, limit=2)
+    notes = retriever.retrieve_smart_notes_for_query(
+        payload.query, top_k=payload.top_k
+    )
+    return {
+        "status": "success",
+        "dossiers": dossiers,
+        "data": notes,
+    }
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/rag/generate")
-async def generate_answer(payload: GenerateRequest, db: Session = Depends(get_db)):
-    try:
-        # 1. Vector retrieval from MinIO
-        retrieved_articles = retriever.retrieve_smart_notes_for_query(payload.question, top_k=payload.top_k)
+async def generate_answer(
+    payload: GenerateRequest, db: Session = Depends(get_db)
+):
+  try:
+    # 1. Quality-gated retrieval of master dossiers (SQL macro anchor)
+    dossier_contexts = fetch_quality_gated_dossiers(
+        query_str=payload.question,
+        db=db,
+        min_keyword_match_ratio=0.65,
+        max_dossiers=3,
+    )
 
-        # 2. RAG answer generation
-        answer = generator.generate_expert_response(payload.question, retrieved_articles)
+    # 2. Retrieve candidate PIB notes from pgvector + MinIO
+    candidate_notes = retriever.retrieve_smart_notes_for_query(
+        payload.question, top_k=max(payload.top_k, 5)
+    )
 
-        # 3. Log query to database if a user session is present
-        if payload.firebase_uid:
-            user = db.query(User).filter(User.firebase_uid == payload.firebase_uid).first()
-            if user:
-                history_entry = UserQueryHistory(
-                    user_id=user.id,
-                    question=payload.question,
-                    model_answer=answer,
-                )
-                db.add(history_entry)
-                db.commit()
+    # 3. Filter PIB notes using calibrated 0.45 threshold (replaces 0.65)
+    quality_pib_notes = filter_quality_pib_notes(
+        candidate_notes, min_score=0.45
+    )
 
-        return {
-            "status": "success",
-            "sources_count": len(retrieved_articles),
-            "model_answer": answer,
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    # 4. Dynamic Blending
+    blended_sources = []
+    if dossier_contexts:
+      blended_sources.extend(dossier_contexts)
+      blended_sources.extend(quality_pib_notes[:2])
+    else:
+      blended_sources.extend(quality_pib_notes[: payload.top_k])
+
+    # 5. Guard against empty context
+    if not blended_sources:
+      return {
+          "status": "success",
+          "sources_count": 0,
+          "has_dossier_anchor": False,
+          "references": [],
+          "model_answer": (
+              "No directly relevant current affairs dossiers or PIB releases met"
+              " the confidence threshold for this query. Please refine your"
+              " query or specify a constitutional provision."
+          ),
+      }
+
+    # 6. Generate answer using strictly high-relevance sources
+    answer = generator.generate_expert_response(
+        payload.question, blended_sources
+    )
+
+    # 7. Log query history
+    if payload.firebase_uid:
+      user = (
+          db.query(User)
+          .filter(User.firebase_uid == payload.firebase_uid)
+          .first()
+      )
+      if user:
+        history_entry = UserQueryHistory(
+            user_id=user.id,
+            question=payload.question,
+            model_answer=answer,
+        )
+        db.add(history_entry)
+        db.commit()
+
+    # 8. Resolve real titles and confidence percentages for references
+    references = []
+    for s in blended_sources:
+      smart_note_data = (
+          s.get("smart_notes") if isinstance(s.get("smart_notes"), dict) else {}
+      )
+
+      resolved_title = (
+          s.get("headline")
+          or s.get("title")
+          or smart_note_data.get("headline")
+          or smart_note_data.get("title")
+          or f"PIB Release #{s.get('prid', '')}"
+      )
+
+      # Extract similarity or confidence
+      conf_val = s.get("confidence_percentage")
+      if conf_val is None:
+        if s.get("similarity_score") is not None:
+          conf_val = round(float(s["similarity_score"]) * 100, 2)
+        elif s.get("relevance_score") is not None:
+          conf_val = round(float(s["relevance_score"]) * 100, 2)
+
+      references.append({
+          "title": resolved_title,
+          "type": s.get("source_type", "article"),
+          "source": s.get("source") or s.get("publication") or "PIB Note",
+          "slug": s.get("issue_slug"),
+          "prid": s.get("prid"),
+          "confidence": f"{conf_val}%" if conf_val is not None else None,
+      })
+
+    return {
+        "status": "success",
+        "sources_count": len(blended_sources),
+        "has_dossier_anchor": len(dossier_contexts) > 0,
+        "references": references,
+        "model_answer": answer,
+    }
+
+  except Exception as e:
+    db.rollback()
+    raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/users/history")
 async def get_user_history(
@@ -204,16 +489,22 @@ async def get_user_history(
 
 @app.get("/api/laxmikanth/chapters")
 async def get_laxmikanth_chapters():
-    """Returns the ordered list of all 92 chapters from Laxmikanth 8th Edition."""
+    cache_key = "laxmikanth:chapters_list"
+    cached = get_cached_json(cache_key)
+    if cached:
+        return cached
+
     chapters = [
         {"id": ch_num, "title": title}
         for ch_num, title in sorted(LAXMIKANTH_8TH_EDITION.items())
     ]
-    return {
+    response = {
         "status": "success",
         "total_chapters": len(chapters),
         "chapters": chapters,
     }
+    set_cached_json(cache_key, response, ex_seconds=2592000)  # 30 days
+    return response
 
 @app.post("/api/laxmikanth/complete")
 async def mark_chapter_completed(payload: CompleteChapterRequest, db: Session = Depends(get_db)):
@@ -290,7 +581,8 @@ async def get_user_chapter_progress(firebase_uid: str, db: Session = Depends(get
     }
 
 @app.post("/api/laxmikanth/study")
-async def study_laxmikanth_chapter(payload: ChapterStudyRequest):
+@limiter.limit("10/minute")
+async def study_laxmikanth_chapter(request:Request,payload: ChapterStudyRequest):
    
     chapter_id = payload.chapter_id or payload.chapter_number
     if not chapter_id and payload.chapter_title and payload.chapter_title.strip() != "string":
@@ -350,6 +642,11 @@ async def study_laxmikanth_chapter(payload: ChapterStudyRequest):
 @app.get("/api/current-affairs/chapters")
 def list_ca_chapters():
     """Lists top-level chapters in MinIO under pib/smart_notes/"""
+    cache_key = "ca:chapters"
+    cached = get_cached_json(cache_key)
+    if cached:
+        return cached
+
     try:
         objects = storage.client.list_objects(storage.bucket, prefix=SMART_NOTES_PREFIX, recursive=False)
         chapters = []
@@ -361,17 +658,24 @@ def list_ca_chapters():
                         "id": folder_name,
                         "title": folder_name
                     })
-        return {
+        response = {
             "status": "success",
             "total": len(chapters),
             "chapters": sorted(chapters, key=lambda x: x["title"])
         }
+        set_cached_json(cache_key, response, ex_seconds=7200)  # 2 hours
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/current-affairs/topics")
 def list_ca_topics(chapter: str = Query(..., description="Chapter name")):
     """Lists sub-topics under a selected chapter in MinIO"""
+    cache_key = f"ca:topics:{chapter.strip('/')}"
+    cached = get_cached_json(cache_key)
+    if cached:
+        return cached
+
     try:
         prefix = f"{SMART_NOTES_PREFIX}{chapter.strip('/')}/"
         objects = storage.client.list_objects(storage.bucket, prefix=prefix, recursive=False)
@@ -386,20 +690,26 @@ def list_ca_topics(chapter: str = Query(..., description="Chapter name")):
                         "full_path": f"{chapter.strip('/')}/{topic_name}",
                         "title": topic_name
                     })
-        return {
+        response = {
             "status": "success",
             "chapter": chapter,
             "total": len(topics),
             "topics": sorted(topics, key=lambda x: x["title"])
         }
+        set_cached_json(cache_key, response, ex_seconds=7200)  # 2 hours
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/current-affairs/notes")
 def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commission/Election Commission")):
     """Lists smart note files inside a topic, extracting the real headline from each note."""
+    cache_key = f"ca:notes:{topic_path.strip('/')}"
+    cached = get_cached_json(cache_key)
+    if cached:
+        return cached
+
     try:
-        # Check both raw path and space/hyphen normalized variants
         prefixes_to_try = [
             f"{SMART_NOTES_PREFIX}{topic_path.strip('/')}/",
             f"{SMART_NOTES_PREFIX}{topic_path.replace('-', ' ').strip('/')}/",
@@ -419,7 +729,6 @@ def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commis
                 filename = obj.object_name.split("/")[-1]
                 prid = filename.replace("smart_notes_", "").replace(".json", "")
                 
-                # Fetch note content to extract actual headline
                 real_title = f"PIB Release #{prid}"
                 summary_preview = ""
                 try:
@@ -439,15 +748,16 @@ def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commis
                     "size_kb": round(obj.size / 1024, 2)
                 })
 
-        return {
+        response = {
             "status": "success",
             "topic_path": topic_path,
             "total": len(notes),
             "notes": sorted(notes, key=lambda x: x["filename"], reverse=True)
         }
+        set_cached_json(cache_key, response, ex_seconds=3600)  # 1 hour
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 @app.get("/api/current-affairs/note-content")
@@ -456,6 +766,11 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
     Reads a PIB UPSC smart note from MinIO and converts all 8 intelligence
     dimensions into a comprehensive, beautifully styled Markdown document.
     """
+    cache_key = f"ca:content:{object_key}"
+    cached = get_cached_json(cache_key)
+    if cached:
+        return cached
+
     try:
         raw_data = storage.get_json(object_key)
 
@@ -469,7 +784,6 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
 
         headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Study Note"
         
-        # Format timestamp if present
         meta_date = ""
         if "generated_at" in raw_data and raw_data["generated_at"]:
             try:
@@ -484,17 +798,14 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
             "---"
         ]
 
-        # 1. Executive Summary
         if raw_data.get("summary"):
             md.append("## 📌 Executive Summary")
             md.append(f"{raw_data['summary'].strip()}\n")
 
-        # 2. Why It Matters
         if raw_data.get("why_it_matters"):
             md.append("## 💡 Why It Matters for UPSC")
             md.append(f"{raw_data['why_it_matters'].strip()}\n")
 
-        # 3. Smart Key Notes (High-Yield Bullets)
         smart_notes = raw_data.get("smart_notes")
         if isinstance(smart_notes, list) and smart_notes:
             md.append("## 📝 Smart Notes (Key Exam Highlights)")
@@ -502,7 +813,6 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
                 md.append(f"* {str(pt).strip()}")
             md.append("")
 
-        # 4. Backward Linkages (Static Polity & Laxmikanth Foundation)
         linkages = raw_data.get("backward_linkages")
         if isinstance(linkages, list) and linkages:
             md.append("## 🔗 Backward Linkages (Static Syllabus & Case Laws)")
@@ -511,13 +821,11 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
                 md.append(f"* {clean_item}")
             md.append("")
 
-        # 5. Mains Relevance Syllabus Mapping
         mains_tags = raw_data.get("upsc_relevance_mains")
         if mains_tags:
             md.append("## 🎯 UPSC Mains Syllabus Mapping")
             md.append(f"Keywords / Themes: {str(mains_tags).strip()}\n")
 
-        # 6. Prelims Practice Statements & Explanations
         prelims = raw_data.get("prelims_practice_points")
         if isinstance(prelims, list) and prelims:
             md.append("## 🧭 Prelims Practice Statements")
@@ -537,19 +845,21 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
                 else:
                     md.append(f"* {str(item).strip()}")
 
-        # 7. Mains Practice Question
         if raw_data.get("mains_question"):
             md.append("## ✍️ Mains Analytical Practice Question")
             md.append(f"> *\"{raw_data['mains_question'].strip()}\"*\n")
 
-        return {
-                    "status": "success",
-                    "title": headline,
-                    "object_key": object_key,
-                    "markdown": "\n".join(md)
-                }
+        response = {
+            "status": "success",
+            "title": headline,
+            "object_key": object_key,
+            "markdown": "\n".join(md)
+        }
+        set_cached_json(cache_key, response, ex_seconds=604800)  # 7 days
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/notes")
 async def get_user_notes(firebase_uid: str, db: Session = Depends(get_db)):

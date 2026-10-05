@@ -20,13 +20,16 @@ class UPSCRetriever:
             return []
         query_embedding = query_embeddings[0]
 
-        # 2. Query pgvector against the 1024-dim column with managed session lifecycle
+        # 2. Compute cosine distance explicitly in SQL query
         db = SessionLocal()
         try:
-            chunks = (
-                db.query(DocumentChunkModel)
+            distance_col = DocumentChunkModel.embedding_1024.cosine_distance(query_embedding).label("distance")
+            
+            # Select both the chunk model and the distance column
+            results = (
+                db.query(DocumentChunkModel, distance_col)
                 .filter(DocumentChunkModel.embedding_1024.isnot(None))
-                .order_by(DocumentChunkModel.embedding_1024.cosine_distance(query_embedding))
+                .order_by(distance_col.asc())
                 .limit(top_k * 3)
                 .all()
             )
@@ -39,10 +42,15 @@ class UPSCRetriever:
         seen_prids = set()
         resolved_articles = []
 
-        # 3. Construct MinIO / R2 path using chunk metadata
-        for chunk in chunks:
+        # 3. Construct MinIO path and calculate confidence score
+        for chunk, distance in results:
             if chunk.prid not in seen_prids:
                 seen_prids.add(chunk.prid)
+                
+                # Convert cosine distance to 0.0 - 1.0 similarity and percentage
+                cosine_dist = float(distance) if distance is not None else 1.0
+                similarity_score = max(0.0, 1.0 - cosine_dist)
+                confidence_pct = round(similarity_score * 100, 2)
                 
                 try:
                     safe_chap = self._safe_path(chunk.chapter_name)
@@ -55,6 +63,9 @@ class UPSCRetriever:
                         "chapter": chunk.chapter_name,
                         "topic": chunk.topic,
                         "matched_chunk_type": chunk.chunk_type,
+                        "cosine_distance": round(cosine_dist, 4),
+                        "similarity_score": round(similarity_score, 4),
+                        "confidence_percentage": confidence_pct,
                         "smart_notes": raw_data
                     })
                 except Exception as e:
@@ -64,3 +75,4 @@ class UPSCRetriever:
                 break
 
         return resolved_articles
+

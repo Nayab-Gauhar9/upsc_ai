@@ -96,7 +96,7 @@ CRITICAL FORMATTING INSTRUCTIONS:
             ],
             model=self.model_name,
             temperature=0.2,
-            max_tokens=5000,
+            max_tokens=1000,
         )
 
         return chat_completion.choices[0].message.content

@@ -1,6 +1,7 @@
 import os
 import json
 import redis
+from typing import Any, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,7 +10,7 @@ redis_url = os.getenv("REDIS_URL")
 
 try:
     if redis_url:
-        # Connect via full connection URL (e.g. rediss://default:... for Upstash cloud)
+        # Production Upstash / cloud TLS connection
         redis_client = redis.from_url(
             redis_url,
             decode_responses=True,
@@ -17,7 +18,7 @@ try:
             protocol=2,
         )
     else:
-        # Fallback to local host & port
+        # Local development fallback
         redis_client = redis.Redis(
             host=os.getenv("REDIS_HOST", "localhost"),
             port=int(os.getenv("REDIS_PORT", 6380)),
@@ -31,26 +32,30 @@ except Exception as e:
     redis_client = None
 
 
-def get_cached_chapter(chapter_id: int) -> dict | None:
+def get_cached_json(key: str) -> Optional[Any]:
+    """Retrieve and deserialize JSON data from Redis."""
     try:
         if redis_client:
-            cached = redis_client.get(f"laxmikanth:chapter:{chapter_id}")
-            if cached:
-                print(f"[CACHE HIT] Loaded Ch.{chapter_id} from Redis")
-                return json.loads(cached)
+            val = redis_client.get(key)
+            if val:
+                return json.loads(val)
     except Exception as e:
-        print(f"[CACHE ERROR GET] {e}")
+        print(f"[CACHE GET ERROR] {key}: {e}")
     return None
 
 
-def set_cached_chapter(chapter_id: int, data: dict, expire_days: int = 30) -> None:
+def set_cached_json(key: str, data: Any, ex_seconds: Optional[int] = 86400) -> None:
+    """Serialize and write data to Redis with an explicit TTL."""
     try:
         if redis_client:
-            redis_client.set(
-                f"laxmikanth:chapter:{chapter_id}",
-                json.dumps(data),
-                ex=expire_days * 86400,
-            )
-            print(f"[CACHE SET] Stored Ch.{chapter_id} in Redis")
+            redis_client.set(key, json.dumps(data), ex=ex_seconds)
     except Exception as e:
-        print(f"[CACHE ERROR SET] {e}")
+        print(f"[CACHE SET ERROR] {key}: {e}")
+
+
+def get_cached_chapter(chapter_id: int) -> dict | None:
+    return get_cached_json(f"laxmikanth:chapter:{chapter_id}")
+
+
+def set_cached_chapter(chapter_id: int, data: dict, expire_days: int = 30) -> None:
+    set_cached_json(f"laxmikanth:chapter:{chapter_id}", data, ex_seconds=expire_days * 86400)

@@ -1,11 +1,11 @@
 
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 
-from sqlalchemy import DateTime, Integer, String, Text, UUID, ForeignKey, UniqueConstraint
+from sqlalchemy import DateTime, Integer, String, Text, UUID, ForeignKey, UniqueConstraint, func, Date
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from pgvector.sqlalchemy import Vector
-
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
 from src.database.base import Base
 
 
@@ -276,4 +276,138 @@ class UserNote(Base):
 
     user: Mapped["User"] = relationship(
         back_populates="notes",
+    )
+
+
+class IssueDossierModel(Base):
+    """Represents a developing constitutional/governance issue anchor (Topic State Node)."""
+    __tablename__ = "issue_dossiers"
+
+    issue_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+
+    issue_slug: Mapped[str] = mapped_column(
+        String(120),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
+    title: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    chapter_name: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default="active",
+        nullable=False,
+    )
+
+    canonical_summary: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    mains_framework: Mapped[dict | None] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=True,
+    )
+
+    article_count: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        nullable=False,
+    )
+
+    first_detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    last_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # 1-to-many relationship with graph edges
+    edges: Mapped[list["IssueGraphEdgeModel"]] = relationship(
+        back_populates="dossier",
+        cascade="all, delete-orphan",
+        order_by="IssueGraphEdgeModel.event_date.asc()",
+    )
+
+
+class IssueGraphEdgeModel(Base):
+    """Directed edge linking an ingested article, viewpoint stance, and legal anchors to an issue."""
+    __tablename__ = "issue_graph_edges"
+
+    edge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+
+    issue_slug: Mapped[str] = mapped_column(
+        String(120),
+        ForeignKey("issue_dossiers.issue_slug", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    prid: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        index=True,
+    )
+
+    publication: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+
+    event_date: Mapped[date] = mapped_column(
+        Date,
+        default=date.today,
+        nullable=False,
+        index=True,
+    )
+
+    perspective_stance: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,  # e.g., 'JUDICIAL_PRIMACY', 'EXECUTIVE_ACCOUNTABILITY'
+    )
+
+    core_claim: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    legal_anchors: Mapped[list[str]] = mapped_column(
+        ARRAY(String),
+        default=list,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    dossier: Mapped["IssueDossierModel"] = relationship(
+        back_populates="edges",
     )
