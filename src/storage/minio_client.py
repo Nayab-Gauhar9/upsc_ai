@@ -257,3 +257,16 @@ class MinIOStorage:
             data = study_intelligence.model_dump(mode="json") if hasattr(study_intelligence, "model_dump") else study_intelligence
             self.upload_json(object_name, data)
             return object_name
+    def upload_static_chapter_note(self, chapter_id: int, note_data: dict) -> str:
+        """Stores precomputed static Laxmikanth chapter dossier in upsc-ai bucket."""
+        object_name = f"static/laxmikanth/chapter_{chapter_id:02d}.json"
+        self.upload_json(object_name, note_data)
+        return object_name
+
+    def get_static_chapter_note(self, chapter_id: int) -> dict | None:
+        """Fetches precomputed static Laxmikanth chapter note from upsc-ai bucket."""
+        object_name = f"static/laxmikanth/chapter_{chapter_id:02d}.json"
+        try:
+            return self.get_json(object_name)
+        except Exception:
+            return None

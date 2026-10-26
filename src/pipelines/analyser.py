@@ -140,4 +140,4 @@ class StudySynthesisPipeline:
 
 if __name__ == "__main__":
     pipeline = StudySynthesisPipeline()
-    pipeline.process_all_relevant(limit=2)
+    pipeline.process_all_relevant()

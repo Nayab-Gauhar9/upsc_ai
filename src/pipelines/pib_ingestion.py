@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
-
+import time
+from datetime import datetime, timezone
 from src.collectors.pib_rss import fetch_rss, parse_rss
 from src.collectors.pib_article import collect_article
 from src.processors.normalize_validate import (
@@ -132,7 +133,8 @@ def run_pib_ingestion(limit=None):
                 print(
                     f"[UNEXPECTED ERROR] PRID {prid}: {e}"
                 )
-
+            finally:
+                time.sleep(1.0)
         print("\n========== PIB INGESTION SUMMARY ==========")
         print("TOTAL RSS ITEMS :", total)
         print("COLLECTED       :", collected)

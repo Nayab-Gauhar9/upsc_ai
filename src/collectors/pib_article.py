@@ -1,11 +1,37 @@
-import requests
+import time
+from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+
 from src.collectors.pib_rss import fetch_rss, parse_rss
 from src.processors.normalize_validate import normalize_record, validate_record
 
-
 BASE_URL = "https://www.pib.gov.in/PressReleasePage.aspx"
+
+# Reusable session with connection pooling and retries
+_session = requests.Session()
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=10, pool_maxsize=10)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
 
 def build_url(prid):
@@ -13,119 +39,98 @@ def build_url(prid):
 
 
 def fetch_article(url):
-    response = requests.get(
-        url,
-        timeout=30,
-        headers={
-            "User-Agent": "Mozilla/5.0"
-        }
-    )
-
-    response.raise_for_status()
-
-    return response.text
+    try:
+        # 5s connect timeout, 30s read timeout
+        response = _session.get(url, timeout=(5.0, 30.0), headers=BROWSER_HEADERS)
+        if response.status_code == 200:
+            return response.text
+        print(f"[!] Non-200 HTTP code {response.status_code} for URL: {url}")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"[TIMEOUT] Read timed out for URL: {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"[REQUEST ERROR] Failed fetching {url}: {e}")
+        return None
 
 
 def detect_language(soup):
     text = soup.get_text(" ", strip=True)
-
     hindi_chars = 0
     english_chars = 0
 
     for char in text:
         if "\u0900" <= char <= "\u097F":
             hindi_chars += 1
-
         elif ("A" <= char <= "Z") or ("a" <= char <= "z"):
             english_chars += 1
 
     if hindi_chars > english_chars:
         return "hi"
-
     return "en"
 
 
 def find_english_url(soup):
     for link in soup.find_all("a", href=True):
-
         text = link.get_text(" ", strip=True).lower()
-
         if text == "english":
-
             return link["href"]
-
     return None
 
 
 def extract_prid(url):
     parsed_url = urlparse(url)
-
     query = parse_qs(parsed_url.query)
-
     prid = query.get("PRID")
-
     if prid:
         return prid[0]
-
     return None
 
 
 def resolve_article(prid):
-
     original_url = build_url(prid)
-
     print("=" * 80)
     print("ORIGINAL PRID:", prid)
     print("ORIGINAL URL:", original_url)
 
     html = fetch_article(original_url)
+    if not html:
+        return None
 
     soup = BeautifulSoup(html, "html.parser")
-
     language = detect_language(soup)
-
     print("DETECTED LANGUAGE:", language)
 
     # Article is already English
     if language == "en":
-
         print("ARTICLE IS ALREADY ENGLISH")
-
         return {
             "source_prid": prid,
             "language": "en",
             "english_prid": prid,
             "english_url": original_url,
-            "soup": soup
+            "soup": soup,
         }
 
     # Article is not English
     print("ARTICLE IS NOT ENGLISH")
-
     english_url = find_english_url(soup)
-
     if not english_url:
-
         print("NO ENGLISH VERSION FOUND")
-
         return {
             "source_prid": prid,
             "language": language,
             "english_prid": None,
             "english_url": None,
-            "soup": None
+            "soup": None,
         }
 
     english_prid = extract_prid(english_url)
-
-    # Fetch English version
     english_html = fetch_article(english_url)
+    if not english_html:
+        return None
 
-    english_soup = BeautifulSoup(
-        english_html,
-        "html.parser"
-    )
-
+    english_soup = BeautifulSoup(english_html, "html.parser")
     english_language = detect_language(english_soup)
 
     print("ENGLISH PAGE LANGUAGE:", english_language)
@@ -137,7 +142,7 @@ def resolve_article(prid):
         "language": language,
         "english_prid": english_prid,
         "english_url": english_url,
-        "soup": english_soup
+        "soup": english_soup,
     }
 
 
@@ -145,7 +150,6 @@ def extract_basic_metadata(soup):
     title = None
     published_text = None
 
-    # Check headers with non-empty text, prioritizing h2 then h3
     for tag_name in ["h2", "h3", "h4"]:
         for el in soup.find_all(tag_name):
             text = el.get_text(" ", strip=True)
@@ -155,70 +159,52 @@ def extract_basic_metadata(soup):
         if title:
             break
 
-    # Publication date
     date_element = soup.find(id="PrDateTime")
     if date_element:
         published_text = " ".join(date_element.get_text(" ", strip=True).split())
 
-    return {
-        "title": title,
-        "published_at": published_text
-    }
+    return {"title": title, "published_at": published_text}
+
 
 def extract_article_content(soup):
-
     date_element = soup.find(id="PrDateTime")
-
     if not date_element:
         print("DATE ELEMENT NOT FOUND")
         return ""
 
     article_container = date_element.find_parent(
-        "div",
-        class_="innner-page-main-about-us-content-right-part"
+        "div", class_="innner-page-main-about-us-content-right-part"
     )
-
     if not article_container:
         print("ARTICLE CONTAINER NOT FOUND")
         return ""
 
     children = article_container.find_all(recursive=False)
-
     article_parts = []
     collecting = False
 
     for child in children:
-
         if child == date_element:
             collecting = True
             continue
-
         if not collecting:
             continue
-
         text = child.get_text(" ", strip=True)
-
         if text:
             article_parts.append(text)
 
-    # Join everything first
     article_text = "\n\n".join(article_parts)
 
-    # -----------------------------------------
-    # Remove everything from *** onwards
-    # -----------------------------------------
-
     marker_position = article_text.find("***")
-
     if marker_position != -1:
         article_text = article_text[:marker_position].rstrip()
 
     return article_text
 
+
 def collect_article(prid, fallback_title=None):
     result = resolve_article(prid)
-
-    if result["soup"] is None:
+    if not result or result.get("soup") is None:
         return None
 
     metadata = extract_basic_metadata(result["soup"])
@@ -234,72 +220,43 @@ def collect_article(prid, fallback_title=None):
         "url": result["english_url"],
         "title": final_title,
         "published_at": metadata["published_at"],
-        "article_text": article
+        "article_text": article,
     }
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     xml_data = fetch_rss()
     articles = parse_rss(xml_data)
 
     records = []
-
     print("=" * 80)
     print(f"RSS ARTICLES FOUND: {len(articles)}")
     print("=" * 80)
 
     for index, item in enumerate(articles, start=1):
-
         rss_url = item["link"]
         prid = extract_prid(rss_url)
 
         print(f"\n[{index}/{len(articles)}] PRID: {prid}")
-
         if not prid:
             print("PRID NOT FOUND")
             continue
 
         try:
-
             record = collect_article(prid)
-
             if record is None:
-                print("NO ENGLISH VERSION")
+                print("NO ENGLISH VERSION OR FETCH FAILED")
                 continue
             normalized = normalize_record(record)
-            valid,error = validate_record(normalized)
+            valid, error = validate_record(normalized)
             if not valid:
                 print("VALIDATION FAILED:", error)
                 continue
             records.append(normalized)
-
             print("STATUS: VALID")
             print("TITLE:", record["title"])
-
         except Exception as e:
-
             print("ERROR:", e)
 
-
     print("\n" + "=" * 100)
-    print("NORMALIZED RECORD VALIDATION")
-    print("=" * 100)
-
     print("TOTAL RECORDS:", len(records))
-
-    for index, record in enumerate(records, start=1):
-
-        print("\n" + "-" * 100)
-        print(f"RECORD {index}")
-
-        print("SOURCE:", record["source"])
-        print("SOURCE PRID:", record["source_prid"])
-        print("SOURCE LANGUAGE:", record["source_language"])
-        print("ENGLISH PRID:", record["english_prid"])
-        print("TITLE:", record["title"])
-        print("PUBLISHED:", record["published_at"])
-
-        print(
-            "ARTICLE LENGTH:",
-            len(record["article_text"])
-        )

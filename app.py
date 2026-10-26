@@ -581,9 +581,8 @@ async def get_user_chapter_progress(firebase_uid: str, db: Session = Depends(get
     }
 
 @app.post("/api/laxmikanth/study")
-@limiter.limit("10/minute")
-async def study_laxmikanth_chapter(request:Request,payload: ChapterStudyRequest):
-   
+@limiter.limit("30/minute")
+async def study_laxmikanth_chapter(request: Request, payload: ChapterStudyRequest):
     chapter_id = payload.chapter_id or payload.chapter_number
     if not chapter_id and payload.chapter_title and payload.chapter_title.strip() != "string":
         chapter_id = CHAPTER_BY_TITLE.get(payload.chapter_title.strip())
@@ -595,26 +594,24 @@ async def study_laxmikanth_chapter(request:Request,payload: ChapterStudyRequest)
         )
 
     chapter_title = LAXMIKANTH_8TH_EDITION[chapter_id]
+    minio_key = f"static/laxmikanth/chapter_{chapter_id:02d}.json"
+    cache_key = f"chapter:static:v1:{chapter_id}"
 
-    # 2. Check Redis cache first
-    cached_payload = get_cached_chapter(chapter_id)
-    if cached_payload:
-        return {
-            "status": "success",
-            "source": "cache",
-            **cached_payload,
-        }
+    # 1. Redis Cache Check
+    cached = get_cached_json(cache_key)
+    if cached:
+        return {"status": "success", "source": "cache", **cached}
 
-    # 3. Cache Miss: Generate notes via LLM (Points 1 & 3 only)
+    # 2. Fetch from MinIO (upsc-ai)
     try:
-        study_notes = generator.generate_chapter_study_notes(
-            chapter_title=chapter_title,
-            chapter_number=chapter_id,
+        raw_data = storage.get_json(minio_key)
+    except Exception:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Chapter {chapter_id} not found in MinIO. Please run the seed script."
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
 
-    # 4. Compute navigation pointers
+    # 3. Navigation
     prev_id = chapter_id - 1 if chapter_id > 1 else None
     next_id = chapter_id + 1 if chapter_id < len(LAXMIKANTH_8TH_EDITION) else None
 
@@ -627,17 +624,12 @@ async def study_laxmikanth_chapter(request:Request,payload: ChapterStudyRequest)
             "next_chapter_id": next_id,
             "next_chapter_title": LAXMIKANTH_8TH_EDITION.get(next_id) if next_id else None,
         },
-        "study_notes": study_notes,
+        "study_notes": raw_data.get("markdown", ""),
     }
 
-    # 5. Store in Redis
-    set_cached_chapter(chapter_id, result)
+    set_cached_json(cache_key, result, ex_seconds=2592000)
+    return {"status": "success", "source": "minio_store", **result}
 
-    return {
-        "status": "success",
-        "source": "generated",
-        **result,
-    }
 
 @app.get("/api/current-affairs/chapters")
 def list_ca_chapters():
@@ -763,8 +755,8 @@ def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commis
 @app.get("/api/current-affairs/note-content")
 def get_ca_note_content(object_key: str = Query(..., description="MinIO object key")):
     """
-    Reads a PIB UPSC smart note from MinIO and converts all 8 intelligence
-    dimensions into a comprehensive, beautifully styled Markdown document.
+    Reads a PIB UPSC smart note from MinIO and compiles it into an
+    aesthetically styled, high-readability study dossier for mobile.
     """
     cache_key = f"ca:content:{object_key}"
     cached = get_cached_json(cache_key)
@@ -788,66 +780,81 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
         if "generated_at" in raw_data and raw_data["generated_at"]:
             try:
                 dt = datetime.fromisoformat(str(raw_data["generated_at"]))
-                meta_date = f" *| Generated: {dt.strftime('%d %B %Y')}*"
+                meta_date = f" • {dt.strftime('%d %B %Y')}"
             except Exception:
-                meta_date = f" *| {raw_data['generated_at']}*"
+                meta_date = f" • {raw_data['generated_at']}"
 
+        # -------------------------------------------------------------
+        # Aesthetic Mobile Markdown Construction (No broken blockquotes)
+        # -------------------------------------------------------------
         md: list[str] = [
-            f"# {headline}",
-            f"> PIB UPSC Intelligence Note{meta_date}\n",
-            "---"
+            f"# {headline}\n",
+            f"🏷️ GS-II Intelligence Dossier{meta_date} • *Polity Mentor verified*",
+            "\n---\n"
         ]
 
+        # 1. Executive Summary
         if raw_data.get("summary"):
-            md.append("## 📌 Executive Summary")
+            md.append("### 📌 Executive Summary\n")
             md.append(f"{raw_data['summary'].strip()}\n")
+            md.append("\n---\n")
 
+        # 2. Why It Matters for UPSC
         if raw_data.get("why_it_matters"):
-            md.append("## 💡 Why It Matters for UPSC")
+            md.append("### 💡 Why It Matters for UPSC\n")
             md.append(f"{raw_data['why_it_matters'].strip()}\n")
+            md.append("\n---\n")
 
+        # 3. Smart Notes (Key Exam Highlights)
         smart_notes = raw_data.get("smart_notes")
         if isinstance(smart_notes, list) and smart_notes:
-            md.append("## 📝 Smart Notes (Key Exam Highlights)")
+            md.append("### 📝 Smart Notes (Key Exam Highlights)\n")
             for pt in smart_notes:
-                md.append(f"* {str(pt).strip()}")
-            md.append("")
+                md.append(f"• {str(pt).strip()}\n")
+            md.append("\n---\n")
 
+        # 4. Backward Linkages (Static Syllabus & Case Laws)
         linkages = raw_data.get("backward_linkages")
         if isinstance(linkages, list) and linkages:
-            md.append("## 🔗 Backward Linkages (Static Syllabus & Case Laws)")
+            md.append("### 🔗 Backward Linkages (Static Syllabus & Articles)\n")
             for item in linkages:
                 clean_item = str(item).replace("⚑", "—").strip()
-                md.append(f"* {clean_item}")
-            md.append("")
+                # Format constitutional provisions with clean inline tags
+                if "—" in clean_item:
+                    parts = clean_item.split("—", 1)
+                    md.append(f"• {parts[0].strip()} — {parts[1].strip()}\n")
+                else:
+                    md.append(f"• {clean_item}\n")
+            md.append("\n---\n")
 
-        mains_tags = raw_data.get("upsc_relevance_mains")
-        if mains_tags:
-            md.append("## 🎯 UPSC Mains Syllabus Mapping")
-            md.append(f"Keywords / Themes: {str(mains_tags).strip()}\n")
-
+        # 5. Prelims Practice Statements (Clean Cards without > blockquotes)
         prelims = raw_data.get("prelims_practice_points")
         if isinstance(prelims, list) and prelims:
-            md.append("## 🧭 Prelims Practice Statements")
+            md.append("### 🧭 Prelims Drill & Fact Checks\n")
             for idx, item in enumerate(prelims, start=1):
                 if isinstance(item, dict):
                     stmt = item.get("statement", "").strip()
                     correct = item.get("is_correct")
                     exp = item.get("explanation", "").strip()
-                    badge = "✅ Correct" if correct is True else ("❌ Incorrect" if correct is False else "")
+                    
+                    badge = "✅ CORRECT" if correct is True else ("❌ INCORRECT" if correct is False else "")
 
-                    md.append(f"Statement {idx}: {stmt}")
+                    md.append(f"Statement {idx}: {stmt}\n")
                     if badge:
-                        md.append(f"> Verdict: {badge}")
+                        md.append(f"• Verdict: {badge}\n")
                     if exp:
-                        md.append(f"> Explanation: {exp}")
+                        md.append(f"• Analysis: {exp}\n")
                     md.append("")
                 else:
-                    md.append(f"* {str(item).strip()}")
+                    md.append(f"• {str(item).strip()}\n")
+            md.append("\n---\n")
 
+# 6. Mains Analytical Practice Question
         if raw_data.get("mains_question"):
-            md.append("## ✍️ Mains Analytical Practice Question")
-            md.append(f"> *\"{raw_data['mains_question'].strip()}\"*\n")
+            md.append("### ✍️ Mains Analytical Question\n")
+            md.append(f"Practice Question:\n")
+            md.append(f"*{raw_data['mains_question'].strip()}*\n")
+            md.append("\n*Framing Focus: 250 Words | 15 Marks | Structural Dialectic*")
 
         response = {
             "status": "success",
@@ -855,10 +862,13 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
             "object_key": object_key,
             "markdown": "\n".join(md)
         }
+        
+        # Invalidate/cache with new format
         set_cached_json(cache_key, response, ex_seconds=604800)  # 7 days
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/api/notes")
