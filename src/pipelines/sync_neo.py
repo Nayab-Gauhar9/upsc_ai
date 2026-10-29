@@ -23,6 +23,7 @@ neon_engine = create_engine(NEON_DB_URL)
 TABLE_CONFIG = [
     # Core User & Tracking Models
     {"name": "users", "pk": "id", "seq": "users_id_seq", "upsert": False},
+    {"name": "user_sessions", "pk": "id", "seq": "user_sessions_id_seq", "upsert": False},
     {"name": "ingestion_runs", "pk": "run_id", "seq": None, "upsert": False},
     {"name": "document_chunks", "pk": "id", "seq": "document_chunks_id_seq", "upsert": False},
     {"name": "user_chapter_progress", "pk": "id", "seq": "user_chapter_progress_id_seq", "upsert": False},
@@ -73,7 +74,6 @@ def serialize_row_values(row_dict: dict) -> dict:
     """Convert dicts/JSON structures to strings for JSONB, but keep native lists for Postgres ARRAY columns."""
     cleaned = {}
     for key, value in row_dict.items():
-        # Keep PostgreSQL native arrays (like mapped_articles, legal_anchors) as raw lists
         if key in ("mapped_articles", "legal_anchors"):
             cleaned[key] = value if value is not None else []
         elif isinstance(value, (dict, list)):
@@ -94,27 +94,35 @@ def sync_table(
 
     with local_engine.connect() as local_conn, neon_engine.connect() as neon_conn:
         local_rows = local_conn.execute(text(f"SELECT * FROM {table_name}")).mappings().all()
+        total_local = len(local_rows)
         if not local_rows:
-            print(f"[{table_name}] Local table is empty. Skipping.")
+            print(f"[{table_name}] Local table is empty. Skipped 0 rows.")
             return
 
         neon_ids_result = neon_conn.execute(text(f'SELECT "{pk_column}" FROM {table_name}'))
         neon_existing_ids = {row[0] for row in neon_ids_result.fetchall()}
 
+        # Classify rows as new vs existing
+        new_rows = [row for row in local_rows if row[pk_column] not in neon_existing_ids]
+        existing_rows = [row for row in local_rows if row[pk_column] in neon_existing_ids]
+
         if upsert:
             target_rows = [serialize_row_values(dict(row)) for row in local_rows]
+
+            to_insert = len(new_rows)
+            to_update = len(existing_rows)
+            skipped = 0
+            print(f"[{table_name}] Total: {total_local} | Moving (New): {to_insert} | Updating: {to_update} | Skipped: {skipped}")
         else:
-            target_rows = [
-                serialize_row_values(dict(row))
-                for row in local_rows
-                if row[pk_column] not in neon_existing_ids
-            ]
+            target_rows = [serialize_row_values(dict(row)) for row in new_rows]
+            to_insert = len(new_rows)
+            to_update = 0
+            skipped = len(existing_rows)
+            print(f"[{table_name}] Total: {total_local} | Moving (New): {to_insert} | Updating: 0 | Skipped (Already Exist): {skipped}")
 
         if not target_rows:
-            print(f"[{table_name}] Already synchronized (0 rows to push).")
+            print(f"[{table_name}] All {skipped} rows are already present in Neon. None moved.")
             return
-
-        print(f"[{table_name}] Preparing to push {len(target_rows)} row(s)...")
 
         keys = list(target_rows[0].keys())
         cols_str = ", ".join(f'"{k}"' for k in keys)
@@ -134,7 +142,10 @@ def sync_table(
             neon_conn.execute(insert_sql, batch)
             neon_conn.commit()
 
-        print(f"[{table_name}] Successfully pushed {len(target_rows)} rows to Neon.")
+        if upsert:
+            print(f"[{table_name}] Completed: {to_insert} inserted, {to_update} updated.")
+        else:
+            print(f"[{table_name}] Completed: {to_insert} moved into Neon, {skipped} skipped.")
 
         if seq_name:
             neon_conn.execute(

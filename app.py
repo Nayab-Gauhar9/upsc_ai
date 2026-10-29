@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from src.storage.minio_client import MinIOStorage
 from src.classifiers.taxonomy import LAXMIKANTH_8TH_EDITION, CHAPTER_BY_TITLE
 from src.database.session import SessionLocal
-from src.database.models import User, UserQueryHistory, UserChapterProgress, UserNote, IssueDossierModel, IssueGraphEdgeModel
+from src.database.models import User, UserQueryHistory, UserChapterProgress, UserNote, IssueDossierModel, IssueGraphEdgeModel, UniqueConstraint, UserSession
 from src.rag.retriever import UPSCRetriever
 from src.pipelines.rag_generator import UPSCRAGGenerator
 from datetime import datetime
@@ -22,7 +22,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
 from src.cache import get_cached_chapter, get_cached_json, set_cached_chapter, set_cached_json
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, func
 from sqlalchemy.orm import selectinload
 
 storage = MinIOStorage()
@@ -295,28 +295,111 @@ class NoteUpdateRequest(BaseModel):
     content: Optional[str] = None
     category: Optional[str] = None
 
-# ---------------------------------------------------------
-# User Sync & Search Endpoints
-# ---------------------------------------------------------
+class UserSessionEventRequest(BaseModel):
+    firebase_uid: str
+    display_name: Optional[str] = None
+    event_type: str = "LOGOUT"
+
+from datetime import datetime, timezone, timedelta
 
 @app.post("/api/users/sync")
-async def sync_firebase_user(payload: UserSyncRequest, db: Session = Depends(get_db)):
-    """Creates or updates a user from Firebase Auth."""
+async def sync_firebase_user(
+    payload: UserSyncRequest, 
+    request: Request, 
+    db: Session = Depends(get_db)
+):
+    """
+    Creates or updates a user from Firebase Auth with dual UID/Email lookup
+    and logs a LOGIN session event in user_sessions idempotently without
+    resetting active user sessions on page re-navigation.
+    """
+    clean_uid = payload.firebase_uid.strip() if payload.firebase_uid else None
+    clean_email = payload.email.lower().strip() if payload.email else None
+    clean_display = payload.display_name.strip() if payload.display_name else None
+
+    if not clean_uid or not clean_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Both 'firebase_uid' and 'email' are mandatory."
+        )
+
     try:
-        user = db.query(User).filter(User.firebase_uid == payload.firebase_uid).first()
+        user = (
+            db.query(User)
+            .filter(
+                or_(
+                    User.firebase_uid == clean_uid,
+                    func.lower(User.email) == clean_email
+                )
+            )
+            .first()
+        )
+
         if not user:
             user = User(
-                firebase_uid=payload.firebase_uid,
-                email=payload.email,
-                display_name=payload.display_name,
+                firebase_uid=clean_uid,
+                email=clean_email,
+                display_name=clean_display or clean_email.split("@")[0],
             )
             db.add(user)
             db.commit()
             db.refresh(user)
         else:
-            if payload.display_name and user.display_name != payload.display_name:
-                user.display_name = payload.display_name
+            has_changes = False
+            if user.firebase_uid != clean_uid:
+                user.firebase_uid = clean_uid
+                has_changes = True
+            if user.email.lower() != clean_email:
+                user.email = clean_email
+                has_changes = True
+            if clean_display and user.display_name != clean_display:
+                user.display_name = clean_display
+                has_changes = True
+
+            if has_changes:
                 db.commit()
+                db.refresh(user)
+
+        # Idempotent Session Login Tracking
+        now_utc = datetime.now(timezone.utc)
+        latest_session = (
+            db.query(UserSession)
+            .filter(UserSession.user_id == user.id)
+            .order_by(UserSession.created_at.desc())
+            .first()
+        )
+
+        should_log_login = False
+
+        if not latest_session:
+            # First time user ever logs in
+            should_log_login = True
+        elif latest_session.event_type == "LOGOUT":
+            # User previously logged out, this is a fresh login
+            should_log_login = True
+        else:
+            # Last event was LOGIN. Check inactivity window (30 minutes)
+            session_time = latest_session.created_at
+            if session_time.tzinfo is None:
+                session_time = session_time.replace(tzinfo=timezone.utc)
+
+            # If user was active over 30 mins ago without logging out, treat as new session
+            if (now_utc - session_time) > timedelta(minutes=30):
+                should_log_login = True
+
+        if should_log_login:
+            session_event = UserSession(
+                user_id=user.id,
+                firebase_uid=clean_uid,
+                display_name=user.display_name,
+                event_type="LOGIN",
+                duration_seconds=None,
+                ip_address=get_client_ip(request),
+                user_agent=request.headers.get("User-Agent", "")[:250],
+                created_at=now_utc,
+            )
+            db.add(session_event)
+            db.commit()
 
         return {
             "status": "success",
@@ -326,7 +409,69 @@ async def sync_firebase_user(payload: UserSyncRequest, db: Session = Depends(get
         }
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Database user sync failed: {str(e)}")
+
+
+from datetime import datetime, timezone
+
+@app.post("/api/users/logout")
+async def log_user_logout(
+    payload: UserSessionEventRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    clean_uid = payload.firebase_uid.strip() if payload.firebase_uid else None
+    if not clean_uid:
+        raise HTTPException(status_code=400, detail="firebase_uid is required.")
+
+    user = db.query(User).filter(User.firebase_uid == clean_uid).first()
+    if not user:
+        return {"status": "ignored", "detail": "User not found"}
+
+    # Use timezone-aware UTC current time
+    now_utc = datetime.now(timezone.utc)
+
+    # Find the most recent LOGIN session for this user
+    latest_login = (
+        db.query(UserSession)
+        .filter(
+            UserSession.user_id == user.id,
+            UserSession.event_type == "LOGIN"
+        )
+        .order_by(UserSession.created_at.desc())
+        .first()
+    )
+
+    duration = None
+    if latest_login and latest_login.created_at:
+        login_time = latest_login.created_at
+        # Ensure login_time is timezone-aware
+        if login_time.tzinfo is None:
+            login_time = login_time.replace(tzinfo=timezone.utc)
+        
+        elapsed = int((now_utc - login_time).total_seconds())
+        duration = max(0, elapsed)
+
+    session_event = UserSession(
+        user_id=user.id,
+        firebase_uid=clean_uid,
+        display_name=payload.display_name or user.display_name,
+        event_type="LOGOUT",
+        duration_seconds=duration,
+        ip_address=get_client_ip(request),
+        user_agent=request.headers.get("User-Agent", "")[:250],
+        created_at=now_utc,
+    )
+    db.add(session_event)
+    db.commit()
+
+    return {
+        "status": "success",
+        "event_type": "LOGOUT",
+        "duration_seconds": duration,
+        "logged_out_at": session_event.created_at.isoformat()
+    }
+
 
 @app.post("/api/rag/search")
 async def search_notes(payload: SearchRequest, db: Session = Depends(get_db)):

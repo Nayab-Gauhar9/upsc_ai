@@ -103,4 +103,4 @@ class VectorIngestionPipeline:
 if __name__ == "__main__":
     pipeline = VectorIngestionPipeline()
     # Test with 2 articles first, then run with limit=None
-    pipeline.process_all_smart_notes(limit=25)
+    pipeline.process_all_smart_notes(limit=100)
