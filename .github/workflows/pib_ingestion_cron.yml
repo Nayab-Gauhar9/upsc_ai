@@ -23,7 +23,7 @@ jobs:
 
       - name: Install minimal ingestion dependencies
         run: |
-          pip install requests beautifulsoup4 minio sqlalchemy "psycopg[binary]" python-dotenv
+          pip install requests beautifulsoup4 minio sqlalchemy "psycopg[binary]" python-dotenv pgvector
 
       - name: Run PIB Ingestion
         env:
