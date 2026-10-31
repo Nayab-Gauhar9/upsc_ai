@@ -1270,6 +1270,86 @@ async def download_user_note_pdf(
         }
     )
 
+from fastapi import Response
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+from datetime import datetime
+
+@app.get("/sitemap.xml", include_in_schema=True)
+async def generate_sitemap(db: Session = Depends(get_db)):
+    """
+    Dynamically generates an XML sitemap pulling real-time slugs from
+    PostgreSQL dossiers and core constitutional foundation chapters.
+    """
+    cache_key = "seo:sitemap:xml"
+    cached = get_cached_json(cache_key)
+    if cached and "xml" in cached:
+        return Response(content=cached["xml"], media_type="application/xml")
+
+    base_url = "https://politymentor.com"
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+    urlset = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
+
+    def add_url(loc: str, priority: str = "0.8", changefreq: str = "weekly", lastmod: str = today_str):
+        url_elem = ET.SubElement(urlset, "url")
+        ET.SubElement(url_elem, "loc").text = loc
+        ET.SubElement(url_elem, "lastmod").text = lastmod
+        ET.SubElement(url_elem, "changefreq").text = changefreq
+        ET.SubElement(url_elem, "priority").text = priority
+
+    # 1. Main Navigation & Public Landing Pages
+    add_url(f"{base_url}/", priority="1.0", changefreq="daily")
+    add_url(f"{base_url}/prelims-pyqs", priority="0.9", changefreq="weekly")
+    add_url(f"{base_url}/syllabus", priority="0.8", changefreq="monthly")
+
+    # 2. Static Constitutional Foundations (Neutral, High-Search GS-II Terms)
+    for ch_num, title in LAXMIKANTH_8TH_EDITION.items():
+        # Formats clean slugs: /static-polity/historical-underpinnings-and-evolution
+        clean_slug = "".join(c.lower() if c.isalnum() or c == " " else "" for c in title).strip().replace(" ", "-")
+        add_url(f"{base_url}/static-polity/{clean_slug}", priority="0.8", changefreq="monthly")
+
+    # 3. Dynamic Living Dossiers from Neon PostgreSQL
+    try:
+        dossiers = (
+            db.query(IssueDossierModel.issue_slug, IssueDossierModel.last_updated_at)
+            .filter(IssueDossierModel.issue_slug.isnot(None))
+            .all()
+        )
+        for d in dossiers:
+            mod_date = d.last_updated_at.strftime("%Y-%m-%d") if d.last_updated_at else today_str
+            add_url(f"{base_url}/dossier/{d.issue_slug}", priority="0.9", changefreq="daily", lastmod=mod_date)
+    except Exception as e:
+        print(f"Warning: Could not fetch dossiers for sitemap: {e}")
+
+    # Generate pretty-printed XML string
+    rough_string = ET.tostring(urlset, "utf-8")
+    reparsed = minidom.parseString(rough_string)
+    pretty_xml = reparsed.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
+
+    # Cache for 12 hours so the database is not strained by crawler visits
+    set_cached_json(cache_key, {"xml": pretty_xml}, ex_seconds=43200)
+
+    return Response(content=pretty_xml, media_type="application/xml")
+
+from fastapi.responses import PlainTextResponse
+
+@app.get("/robots.txt", response_class=PlainTextResponse, include_in_schema=True)
+def get_robots_txt():
+    lines = [
+        "User-agent: *",
+        "Allow: /",
+        "Allow: /dossier/*",
+        "Allow: /static-polity/*",
+        "Allow: /prelims-pyqs",
+        "Disallow: /api/",
+        "Disallow: /docs",
+        "Disallow: /openapi.json",
+        "Disallow: /workspace",
+        "",
+        "Sitemap: https://politymentor.com/sitemap.xml",
+    ]
+    return "\n".join(lines)
 
 if __name__ == "__main__":
     import uvicorn

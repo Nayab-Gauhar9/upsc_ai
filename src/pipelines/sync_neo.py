@@ -39,12 +39,6 @@ TABLE_CONFIG = [
         "seq": "constitutional_articles_id_seq",
         "upsert": True,
     },
-    {
-        "name": "prelims_pyqs",
-        "pk": "id",
-        "seq": "prelims_pyqs_id_seq",
-        "upsert": True,
-    },
 
     # Daily Drill Sets & Questions (Parent table first, then child)
     {
@@ -65,6 +59,12 @@ TABLE_CONFIG = [
         "name": "question_reports",
         "pk": "id",
         "seq": None,
+        "upsert": True,
+    },
+    {
+        "name": "content_reports",
+        "pk": "id",
+        "seq": "content_reports_id_seq",
         "upsert": True,
     },
 ]
@@ -148,13 +148,22 @@ def sync_table(
             print(f"[{table_name}] Completed: {to_insert} moved into Neon, {skipped} skipped.")
 
         if seq_name:
-            neon_conn.execute(
-                text(
-                    f"SELECT setval('{seq_name}', COALESCE((SELECT MAX({pk_column}) FROM {table_name}), 1), true);"
+            try:
+                neon_conn.execute(
+                    text(
+                        f"""
+                        SELECT setval(
+                            COALESCE(pg_get_serial_sequence('{table_name}', '{pk_column}'), '{seq_name}'),
+                            COALESCE((SELECT MAX("{pk_column}") FROM {table_name}), 1),
+                            true
+                        );
+                        """
+                    )
                 )
-            )
-            neon_conn.commit()
-            print(f"[{table_name}] Sequence '{seq_name}' updated.")
+                neon_conn.commit()
+                print(f"[{table_name}] Sequence for '{pk_column}' updated.")
+            except Exception as seq_err:
+                print(f"[{table_name}] Sequence update warning: {seq_err}")
 
 
 def sync_all():
