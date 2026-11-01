@@ -194,6 +194,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 ALLOWED_ORIGINS = [
     "https://politymentor.com",
+    "https://admin.politymentor.com",           # <--- Custom admin portal domain
+    "https://polity-admin-portal.pages.dev",
     "https://www.politymentor.com",
     "https://app.flutterflow.io",
     "https://preview.flutterflow.io",
