@@ -472,6 +472,66 @@ async def log_user_logout(
         "logged_out_at": session_event.created_at.isoformat()
     }
 
+@app.get("/api/admin/users")
+def get_admin_users_overview(
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """
+    Administrative overview: returns registered aspirants, recent login sessions,
+    and chapter completion progress counts.
+    """
+    total_users = db.query(func.count(User.id)).scalar() or 0
+    total_notes = db.query(func.count(UserNote.id)).scalar() or 0
+    total_queries = db.query(func.count(UserQueryHistory.id)).scalar() or 0
+
+    users = (
+        db.query(User)
+        .order_by(User.created_at.desc() if hasattr(User, 'created_at') else User.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    user_list = []
+    for u in users:
+        # Get count of completed chapters
+        completed_count = (
+            db.query(func.count(UserChapterProgress.id))
+            .filter(UserChapterProgress.user_id == u.id)
+            .scalar() or 0
+        )
+        
+        # Get latest session event
+        latest_sess = (
+            db.query(UserSession)
+            .filter(UserSession.user_id == u.id)
+            .order_by(UserSession.created_at.desc())
+            .first()
+        )
+
+        user_list.append({
+            "id": u.id,
+            "firebase_uid": u.firebase_uid,
+            "email": u.email,
+            "display_name": u.display_name,
+            "chapters_completed": completed_count,
+            "last_active": latest_sess.created_at.isoformat() if latest_sess else None,
+            "last_event": latest_sess.event_type if latest_sess else "NONE",
+            "last_ip": latest_sess.ip_address if latest_sess else None,
+        })
+
+    return {
+        "status": "success",
+        "stats": {
+            "total_users": total_users,
+            "total_notes": total_notes,
+            "total_ai_queries": total_queries,
+        },
+        "users": user_list
+    }
+
 
 @app.post("/api/rag/search")
 async def search_notes(payload: SearchRequest, db: Session = Depends(get_db)):
