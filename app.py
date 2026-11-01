@@ -1410,7 +1410,435 @@ def get_robots_txt():
         "Sitemap: https://politymentor.com/sitemap.xml",
     ]
     return "\n".join(lines)
+from src.database.models import ContentReport, QuestionReport
+from pydantic import BaseModel
 
+class ReportStatusUpdate(BaseModel):
+    status: str  # 'RESOLVED' or 'DISMISSED'
+
+@app.get("/api/admin/reports")
+def get_all_admin_reports(
+    status_filter: Optional[str] = Query(None, description="PENDING, RESOLVED, or None for all"),
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Fetches combined content hallucination flags and MCQ error reports."""
+    # 1. Content Reports (Hallucinations, Outdated Law, etc.)
+    c_query = db.query(ContentReport)
+    if status_filter and status_filter.upper() != "ALL":
+        c_query = c_query.filter(ContentReport.status == status_filter.upper())
+    content_reports = c_query.order_by(ContentReport.created_at.desc()).limit(limit).all()
+
+    # 2. Daily Drill Question Reports
+    q_query = db.query(QuestionReport)
+    if status_filter and status_filter.upper() != "ALL":
+        q_query = q_query.filter(QuestionReport.status == status_filter.upper())
+    question_reports = q_query.order_by(QuestionReport.created_at.desc()).limit(limit).all()
+
+    # Aggregated counts
+    pending_content = db.query(func.count(ContentReport.id)).filter(ContentReport.status == "PENDING").scalar() or 0
+    pending_questions = db.query(func.count(QuestionReport.id)).filter(QuestionReport.status == "PENDING").scalar() or 0
+
+    return {
+        "status": "success",
+        "metrics": {
+            "pending_content_reports": pending_content,
+            "pending_question_reports": pending_questions,
+            "total_pending": pending_content + pending_questions
+        },
+        "content_reports": [
+            {
+                "id": cr.id,
+                "type": "AI_CONTENT",
+                "firebase_uid": cr.firebase_uid,
+                "issue_category": cr.issue_category,
+                "source_page": cr.source_page,
+                "flagged_content": cr.flagged_content,
+                "user_feedback": cr.user_feedback,
+                "status": cr.status,
+                "created_at": cr.created_at.isoformat() if cr.created_at else None,
+                "resolved_at": cr.resolved_at.isoformat() if cr.resolved_at else None
+            }
+            for cr in content_reports
+        ],
+        "question_reports": [
+            {
+                "id": str(qr.id),
+                "type": "DRILL_MCQ",
+                "user_id": qr.user_id,
+                "drill_date": qr.drill_date,
+                "question_index": qr.question_index,
+                "question_text": qr.question_text,
+                "issue_type": qr.issue_type,
+                "user_notes": qr.user_notes,
+                "status": qr.status,
+                "created_at": qr.created_at.isoformat() if qr.created_at else None
+            }
+            for qr in question_reports
+        ]
+    }
+
+@app.patch("/api/admin/reports/content/{report_id}")
+def update_content_report_status(
+    report_id: int, 
+    payload: ReportStatusUpdate, 
+    db: Session = Depends(get_db)
+):
+    rep = db.query(ContentReport).filter(ContentReport.id == report_id).first()
+    if not rep:
+        raise HTTPException(status_code=404, detail="Content report not found")
+    
+    rep.status = payload.status.upper()
+    if payload.status.upper() == "RESOLVED":
+        rep.resolved_at = datetime.utcnow()
+    db.commit()
+    return {"status": "success", "message": f"Content report #{report_id} updated to {rep.status}"}
+
+@app.patch("/api/admin/reports/question/{report_id}")
+def update_question_report_status(
+    report_id: str, 
+    payload: ReportStatusUpdate, 
+    db: Session = Depends(get_db)
+):
+    rep = db.query(QuestionReport).filter(QuestionReport.id == report_id).first()
+    if not rep:
+        raise HTTPException(status_code=404, detail="Question report not found")
+    
+    rep.status = payload.status.upper()
+    db.commit()
+    return {"status": "success", "message": f"Question report {report_id} updated to {rep.status}"}
+from src.database.models import ConstitutionalArticleModel
+
+@app.get("/api/admin/articles")
+def list_admin_articles(
+    search: Optional[str] = Query(None, description="Search by number or title"),
+    part: Optional[str] = Query(None, description="Filter by Part number"),
+    cluster: Optional[str] = Query(None, description="Filter by doctrine cluster"),
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Lists constitutional provisions with metadata and matrix flags."""
+    query = db.query(ConstitutionalArticleModel)
+
+    if search:
+        pat = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                ConstitutionalArticleModel.article_number.ilike(pat),
+                ConstitutionalArticleModel.title.ilike(pat),
+                ConstitutionalArticleModel.article_slug.ilike(pat)
+            )
+        )
+    if part:
+        query = query.filter(ConstitutionalArticleModel.part_number == part.strip())
+    if cluster:
+        query = query.filter(ConstitutionalArticleModel.doctrine_cluster_id == cluster.strip())
+
+    total = query.count()
+    articles = (
+        query.order_by(ConstitutionalArticleModel.id.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "status": "success",
+        "total": total,
+        "articles": [
+            {
+                "id": a.id,
+                "article_number": a.article_number,
+                "article_slug": a.article_slug,
+                "title": a.title,
+                "part_number": a.part_number,
+                "doctrine_cluster_id": a.doctrine_cluster_id,
+                "has_comparative": a.comparative_matrix is not None,
+                "traps_count": len(a.aspirant_summary.get("prelims_traps", [])) if isinstance(a.aspirant_summary, dict) else 0,
+            }
+            for a in articles
+        ]
+    }
+
+@app.get("/api/admin/articles/{article_id}")
+def get_admin_article_detail(article_id: int, db: Session = Depends(get_db)):
+    """Fetches complete verbatim text, bare act analysis, 4-epoch trajectory, and matrix."""
+    article = db.query(ConstitutionalArticleModel).filter(ConstitutionalArticleModel.id == article_id).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Constitutional Article not found")
+
+    return {
+        "status": "success",
+        "article": {
+            "id": article.id,
+            "article_number": article.article_number,
+            "article_slug": article.article_slug,
+            "title": article.title,
+            "part_number": article.part_number,
+            "doctrine_cluster_id": article.doctrine_cluster_id,
+            "verbatim_text": article.verbatim_text,
+            "bare_act_analysis": article.bare_act_analysis,
+            "aspirant_summary": article.aspirant_summary,
+            "evolution_trajectory": article.evolution_trajectory,
+            "comparative_matrix": article.comparative_matrix,
+            "created_at": article.created_at.isoformat() if article.created_at else None,
+            "updated_at": article.updated_at.isoformat() if article.updated_at else None,
+        }
+    }
+
+from src.database.models import PrelimsPYQModel
+from pydantic import BaseModel
+from typing import List
+
+class UpdatePYQMappingRequest(BaseModel):
+    chapter_number: Optional[int] = None
+    chapter_name: Optional[str] = None
+    mapped_articles: Optional[List[int]] = None
+    difficulty_level: Optional[str] = None
+    is_conceptual: Optional[bool] = None
+
+@app.get("/api/admin/pyqs")
+def list_admin_pyqs(
+    search: Optional[str] = Query(None, description="Search question text or explanation"),
+    year: Optional[int] = Query(None, description="Filter by exam year"),
+    chapter_number: Optional[int] = Query(None, description="Filter by Laxmikanth chapter (1-92)"),
+    article_number: Optional[int] = Query(None, description="Filter by mapped article integer"),
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Lists Prelims PYQs with article array containment and taxonomy filters."""
+    query = db.query(PrelimsPYQModel)
+
+    if search:
+        pat = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                PrelimsPYQModel.question_text.ilike(pat),
+                PrelimsPYQModel.explanation.ilike(pat)
+            )
+        )
+    if year:
+        query = query.filter(PrelimsPYQModel.year == year)
+    if chapter_number:
+        query = query.filter(PrelimsPYQModel.chapter_number == chapter_number)
+    if article_number:
+        # PostgreSQL GIN array containment: WHERE article_number = ANY(mapped_articles)
+        query = query.filter(PrelimsPYQModel.mapped_articles.any(article_number))
+
+    total = query.count()
+    pyqs = (
+        query.order_by(PrelimsPYQModel.year.desc(), PrelimsPYQModel.question_number.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "status": "success",
+        "total": total,
+        "pyqs": [
+            {
+                "id": p.id,
+                "year": p.year,
+                "question_number": p.question_number,
+                "question_text": p.question_text,
+                "options": p.options,
+                "correct_option": p.correct_option,
+                "chapter_number": p.chapter_number,
+                "chapter_name": p.chapter_name,
+                "mapped_articles": p.mapped_articles,
+                "explanation": p.explanation,
+                "difficulty_level": p.difficulty_level,
+                "is_conceptual": p.is_conceptual,
+            }
+            for p in pyqs
+        ]
+    }
+
+@app.patch("/api/admin/pyqs/{pyq_id}")
+def update_pyq_metadata(
+    pyq_id: int, 
+    payload: UpdatePYQMappingRequest, 
+    db: Session = Depends(get_db)
+):
+    """Updates taxonomy chapter links, difficulty, or mapped constitutional article IDs."""
+    pyq = db.query(PrelimsPYQModel).filter(PrelimsPYQModel.id == pyq_id).first()
+    if not pyq:
+        raise HTTPException(status_code=404, detail="PYQ item not found")
+
+    if payload.chapter_number is not None:
+        pyq.chapter_number = payload.chapter_number
+    if payload.chapter_name is not None:
+        pyq.chapter_name = payload.chapter_name.strip()
+    if payload.mapped_articles is not None:
+        pyq.mapped_articles = sorted(list(set(payload.mapped_articles)))
+    if payload.difficulty_level is not None:
+        pyq.difficulty_level = payload.difficulty_level.strip()
+    if payload.is_conceptual is not None:
+        pyq.is_conceptual = payload.is_conceptual
+
+    db.commit()
+    db.refresh(pyq)
+    return {"status": "success", "message": f"PYQ #{pyq.id} updated"}
+
+from src.database.models import IngestionRun, DocumentChunkModel
+from sqlalchemy import desc
+
+@app.get("/api/admin/ingestion-runs")
+def list_admin_ingestion_runs(
+    source: Optional[str] = Query(None, description="Filter by source e.g. PIB, The Hindu"),
+    limit: int = 30,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Lists recent ingestion runs with execution metrics and failure breakdowns."""
+    query = db.query(IngestionRun)
+    if source:
+        query = query.filter(IngestionRun.source.ilike(f"%{source.strip()}%"))
+
+    total_runs = query.count()
+    runs = query.order_by(IngestionRun.started_at.desc()).offset(offset).limit(limit).all()
+
+    # Aggregate total system health metrics
+    total_valid = db.query(func.coalesce(func.sum(IngestionRun.valid), 0)).scalar()
+    total_failed = db.query(func.coalesce(func.sum(IngestionRun.failed), 0)).scalar()
+    total_chunks = db.query(func.count(DocumentChunkModel.id)).scalar() or 0
+
+    return {
+        "status": "success",
+        "total_runs": total_runs,
+        "metrics": {
+            "total_valid_articles": total_valid,
+            "total_failures": total_failed,
+            "total_vector_chunks": total_chunks
+        },
+        "runs": [
+            {
+                "run_id": str(r.run_id),
+                "source": r.source,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "total_items": r.total_items,
+                "collected": r.collected,
+                "valid": r.valid,
+                "uploaded": r.uploaded,
+                "already_exists": r.already_exists,
+                "failed": r.failed,
+                "failures": {
+                    "collection": r.collection_failures,
+                    "validation": r.validation_failures,
+                    "storage": r.storage_failures,
+                    "unexpected": r.unexpected_failures
+                }
+            }
+            for r in runs
+        ]
+    }
+
+@app.get("/api/admin/ingestion-chunks")
+def list_recent_vector_chunks(
+    limit: int = 25,
+    db: Session = Depends(get_db)
+):
+    """Inspects recently generated text chunks and Qwen 1024-dim embedding vectors."""
+    chunks = (
+        db.query(DocumentChunkModel)
+        .order_by(DocumentChunkModel.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "status": "success",
+        "chunks": [
+            {
+                "id": c.id,
+                "prid": c.prid,
+                "chapter_name": c.chapter_name,
+                "topic": c.topic,
+                "chunk_type": c.chunk_type,
+                "chunk_text": c.chunk_text[:180] + ("..." if len(c.chunk_text) > 180 else ""),
+                "token_count": c.token_count,
+                "embedding_model": c.embedding_model,
+                "has_embedding": c.embedding_1024 is not None
+            }
+            for c in chunks
+        ]
+    }
+
+from src.database.models import IssueDossierModel, IssueGraphEdgeModel
+from sqlalchemy.orm import selectinload
+
+@app.get("/api/admin/dossiers")
+def get_admin_dossiers(
+    search: Optional[str] = Query(None, description="Search dossiers by title, slug, or chapter"),
+    status: Optional[str] = Query(None, description="active, archived, etc."),
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """
+    Administrative overview for living constitutional topic dossiers,
+    prelims factsheet summaries, and connected evolutionary perspective edges.
+    """
+    query = db.query(IssueDossierModel).options(selectinload(IssueDossierModel.edges))
+
+    if search:
+        pat = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                IssueDossierModel.title.ilike(pat),
+                IssueDossierModel.chapter_name.ilike(pat),
+                IssueDossierModel.issue_slug.ilike(pat)
+            )
+        )
+    if status:
+        query = query.filter(IssueDossierModel.status == status.strip().lower())
+
+    total = query.count()
+    dossiers = (
+        query.order_by(IssueDossierModel.last_updated_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    data = []
+    for d in dossiers:
+        data.append({
+            "id": str(d.issue_id),
+            "title": d.title,
+            "issue_slug": d.issue_slug,
+            "chapter_name": d.chapter_name,
+            "status": d.status,
+            "article_count": d.article_count,
+            "canonical_summary": d.canonical_summary,
+            "prelims_factsheet": d.prelims_factsheet or {},
+            "mains_framework": d.mains_framework or {},
+            "first_detected_at": d.first_detected_at.isoformat() if d.first_detected_at else None,
+            "last_updated_at": d.last_updated_at.isoformat() if d.last_updated_at else None,
+            "edges_count": len(d.edges) if d.edges else 0,
+            "perspectives": [
+                {
+                    "publication": e.publication,
+                    "event_date": str(e.event_date) if hasattr(e, 'event_date') else None,
+                    "perspective_stance": e.perspective_stance,
+                    "core_claim": e.core_claim,
+                    "legal_anchors": e.legal_anchors or []
+                }
+                for e in (d.edges if d.edges else [])
+            ]
+        })
+
+    return {
+        "status": "success",
+        "total": total,
+        "dossiers": data
+    }
+
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
