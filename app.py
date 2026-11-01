@@ -1838,7 +1838,35 @@ def get_admin_dossiers(
         "dossiers": data
     }
 
-    
+import os
+import secrets
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "supersecretpassword")
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "your-secret-token-key")
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/admin/login")
+def admin_login(payload: AdminLoginRequest):
+    valid_user = secrets.compare_digest(payload.username.strip(), ADMIN_USERNAME)
+    valid_pass = secrets.compare_digest(payload.password.strip(), ADMIN_PASSWORD)
+
+    if not (valid_user and valid_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid administrative username or password."
+        )
+
+    return {
+        "status": "success",
+        "token": ADMIN_SECRET_KEY
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
