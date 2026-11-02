@@ -1970,44 +1970,128 @@ def list_recent_vector_chunks(
         ]
     }
 
-from src.database.models import IssueDossierModel, IssueGraphEdgeModel
-from sqlalchemy.orm import selectinload
+@app.post("/api/admin/purge-cache")
+def purge_system_cache(tag: str = Query(..., description="blueprint, articles, pyqs, or dossiers")):
+    """Purges Redis cache keys by functional tag."""
+    clean_tag = tag.strip().lower()
+    cleared = 0
 
-@app.patch("/api/admin/pyqs/{pyq_id}")
-def update_pyq_metadata(
-    pyq_id: int, 
-    payload: UpdatePYQMappingRequest, 
+    if clean_tag == "articles":
+        cleared += delete_cached_pattern("articles:*")
+        cleared += delete_cached_pattern("article:*")
+    elif clean_tag == "pyqs":
+        cleared += delete_cached_pattern("pyqs:*")
+        cleared += delete_cached_pattern("blueprint:drill:*")
+    elif clean_tag == "blueprint":
+        cleared += delete_cached_pattern("blueprint:*")
+        cleared += delete_cached_pattern("laxmikanth:*")
+    elif clean_tag == "dossiers":
+        cleared += delete_cached_pattern("admin:dossiers:*")
+        cleared += delete_cached_pattern("dossier:*")
+        cleared += delete_cached_pattern("dossiers:*")
+        delete_cached_key("seo:sitemap:xml")
+        cleared += 1
+    else:
+        raise HTTPException(status_code=400, detail=f"Unrecognized cache tag '{tag}'")
+
+    return {"status": "success", "tag": clean_tag, "keys_evicted": cleared}
+
+@app.get("/api/admin/dossiers")
+def get_admin_dossiers(
+    response: Response,
+    search: Optional[str] = Query(None, description="Search dossiers by title, slug, or chapter"),
+    status: Optional[str] = Query(None, description="active, archived, etc."),
+    limit: int = 50,
+    offset: int = 0,
     db: Session = Depends(get_db)
 ):
-    """Updates taxonomy chapter links, difficulty, or mapped constitutional article IDs and purges cache."""
-    pyq = db.query(PrelimsPYQModel).filter(PrelimsPYQModel.id == pyq_id).first()
-    if not pyq:
-        raise HTTPException(status_code=404, detail="PYQ item not found")
+    """
+    Administrative overview for living constitutional topic dossiers,
+    prelims factsheet summaries, and connected evolutionary perspective edges.
+    """
+    start_time = time.perf_counter()
 
-    if payload.chapter_number is not None:
-        pyq.chapter_number = payload.chapter_number
-    if payload.chapter_name is not None:
-        pyq.chapter_name = payload.chapter_name.strip()
-    if payload.mapped_articles is not None:
-        pyq.mapped_articles = sorted(list(set(payload.mapped_articles)))
-    if payload.difficulty_level is not None:
-        pyq.difficulty_level = payload.difficulty_level.strip()
-    if payload.is_conceptual is not None:
-        pyq.is_conceptual = payload.is_conceptual
+    # Deterministic cache key across filters
+    clean_search = search.strip().lower() if search else "none"
+    clean_status = status.strip().lower() if status else "all"
+    cache_key = f"admin:dossiers:list:s={clean_search}:st={clean_status}:l={limit}:o={offset}"
 
-    db.commit()
-    db.refresh(pyq)
+    # 1. Fast Cache Hit Check
+    cached = get_cached_json(cache_key)
+    if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=180, s-maxage=3600, stale-while-revalidate=60"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return cached
 
-    # --- INSTANT CACHE INVALIDATION ---
-    # 1. Purge all cached PYQ list filter combinations
-    delete_cached_pattern("pyqs:catalogue:*")
-    # 2. Also purge any module drill caches built in blueprint.py
-    delete_cached_pattern("blueprint:drill:*")
-    delete_cached_pattern("blueprint:prelims:*")
+    # 2. Database Fallback (Cache Miss)
+    query = db.query(IssueDossierModel).options(selectinload(IssueDossierModel.edges))
 
-    return {"status": "success", "message": f"PYQ #{pyq.id} updated and caches purged"}
+    if search:
+        pat = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                IssueDossierModel.title.ilike(pat),
+                IssueDossierModel.chapter_name.ilike(pat),
+                IssueDossierModel.issue_slug.ilike(pat)
+            )
+        )
+    if status:
+        query = query.filter(IssueDossierModel.status == clean_status)
 
+    total = query.count()
+    dossiers = (
+        query.order_by(IssueDossierModel.last_updated_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
+    data = []
+    for d in dossiers:
+        data.append({
+            "id": str(d.issue_id),
+            "title": d.title,
+            "issue_slug": d.issue_slug,
+            "chapter_name": d.chapter_name,
+            "status": d.status,
+            "article_count": d.article_count,
+            "canonical_summary": d.canonical_summary,
+            "prelims_factsheet": d.prelims_factsheet or {},
+            "mains_framework": d.mains_framework or {},
+            "first_detected_at": d.first_detected_at.isoformat() if d.first_detected_at else None,
+            "last_updated_at": d.last_updated_at.isoformat() if d.last_updated_at else None,
+            "edges_count": len(d.edges) if d.edges else 0,
+            "perspectives": [
+                {
+                    "publication": e.publication,
+                    "event_date": str(e.event_date) if hasattr(e, 'event_date') else None,
+                    "perspective_stance": e.perspective_stance,
+                    "core_claim": e.core_claim,
+                    "legal_anchors": e.legal_anchors or []
+                }
+                for e in (d.edges if d.edges else [])
+            ]
+        })
+
+    result_payload = {
+        "status": "success",
+        "total": total,
+        "dossiers": data
+    }
+
+    # 3. Cache for 2 hours (7,200s)
+    set_cached_json(cache_key, result_payload, ex_seconds=7200)
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    response.headers["Cache-Control"] = "public, max-age=180, s-maxage=3600, stale-while-revalidate=60"
+    response.headers["X-Cache"] = "MISS"
+    response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+    return result_payload
+
+from src.database.models import IssueDossierModel, IssueGraphEdgeModel
+from sqlalchemy.orm import selectinload
 import os
 import secrets
 from fastapi import FastAPI, HTTPException, status
