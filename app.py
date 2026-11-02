@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Query, Request, status
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -24,7 +24,8 @@ import secrets
 from src.cache import get_cached_chapter, get_cached_json, set_cached_chapter, set_cached_json
 from sqlalchemy import or_, select, func
 from sqlalchemy.orm import selectinload
-
+import time
+from src.cache import delete_cached_key, delete_cached_pattern
 storage = MinIOStorage()
 
 retriever = UPSCRetriever()
@@ -225,10 +226,16 @@ def health_check():
     return {"status": "ok"}
 
 @app.get("/api/notes/latest")
-def get_latest_note():
+def get_latest_note(response: Response):
+    start_time = time.perf_counter()
     cache_key = "ca:notes:latest"
     cached = get_cached_json(cache_key)
+    
     if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=60, s-maxage=600, stale-while-revalidate=30"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
         return cached
 
     try:
@@ -236,14 +243,20 @@ def get_latest_note():
         if not notes:
             return {"status": "empty", "note": None}
         
-        response = {
+        result_payload = {
             "status": "success",
             "note": notes[0]
         }
-        set_cached_json(cache_key, response, ex_seconds=600)  # 10 minutes
-        return response
+        set_cached_json(cache_key, result_payload, ex_seconds=600)  # 10 minutes
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=60, s-maxage=600, stale-while-revalidate=30"
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return result_payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # Database session dependency
 def get_db():
@@ -695,23 +708,35 @@ async def get_user_history(
 # ---------------------------------------------------------
 
 @app.get("/api/laxmikanth/chapters")
-async def get_laxmikanth_chapters():
+async def get_laxmikanth_chapters(response: Response):
+    start_time = time.perf_counter()
     cache_key = "laxmikanth:chapters_list"
     cached = get_cached_json(cache_key)
+    
     if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
         return cached
 
     chapters = [
         {"id": ch_num, "title": title}
         for ch_num, title in sorted(LAXMIKANTH_8TH_EDITION.items())
     ]
-    response = {
+    result_payload = {
         "status": "success",
         "total_chapters": len(chapters),
         "chapters": chapters,
     }
-    set_cached_json(cache_key, response, ex_seconds=2592000)  # 30 days
-    return response
+    set_cached_json(cache_key, result_payload, ex_seconds=2592000)  # 30 days
+    
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=86400"
+    response.headers["X-Cache"] = "MISS"
+    response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+    return result_payload
+
 
 @app.post("/api/laxmikanth/complete")
 async def mark_chapter_completed(payload: CompleteChapterRequest, db: Session = Depends(get_db)):
@@ -839,11 +864,17 @@ async def study_laxmikanth_chapter(request: Request, payload: ChapterStudyReques
 
 
 @app.get("/api/current-affairs/chapters")
-def list_ca_chapters():
+def list_ca_chapters(response: Response):
     """Lists top-level chapters in MinIO under pib/smart_notes/"""
+    start_time = time.perf_counter()
     cache_key = "ca:chapters"
     cached = get_cached_json(cache_key)
+    
     if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=7200, stale-while-revalidate=120"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
         return cached
 
     try:
@@ -853,30 +884,43 @@ def list_ca_chapters():
             if obj.is_dir:
                 folder_name = obj.object_name[len(SMART_NOTES_PREFIX):].strip("/")
                 if folder_name:
-                    chapters.append({
-                        "id": folder_name,
-                        "title": folder_name
-                    })
-        response = {
+                    chapters.append({"id": folder_name, "title": folder_name})
+        result_payload = {
             "status": "success",
             "total": len(chapters),
             "chapters": sorted(chapters, key=lambda x: x["title"])
         }
-        set_cached_json(cache_key, response, ex_seconds=7200)  # 2 hours
-        return response
+        set_cached_json(cache_key, result_payload, ex_seconds=7200)  # 2 hours
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=7200, stale-while-revalidate=120"
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return result_payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/current-affairs/topics")
-def list_ca_topics(chapter: str = Query(..., description="Chapter name")):
+def list_ca_topics(
+    response: Response,
+    chapter: str = Query(..., description="Chapter name")
+):
     """Lists sub-topics under a selected chapter in MinIO"""
-    cache_key = f"ca:topics:{chapter.strip('/')}"
+    start_time = time.perf_counter()
+    clean_chapter = chapter.strip('/')
+    cache_key = f"ca:topics:{clean_chapter}"
     cached = get_cached_json(cache_key)
+    
     if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=7200, stale-while-revalidate=120"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
         return cached
 
     try:
-        prefix = f"{SMART_NOTES_PREFIX}{chapter.strip('/')}/"
+        prefix = f"{SMART_NOTES_PREFIX}{clean_chapter}/"
         objects = storage.client.list_objects(storage.bucket, prefix=prefix, recursive=False)
         topics = []
         for obj in objects:
@@ -886,19 +930,25 @@ def list_ca_topics(chapter: str = Query(..., description="Chapter name")):
                     topics.append({
                         "id": topic_name,
                         "chapter": chapter,
-                        "full_path": f"{chapter.strip('/')}/{topic_name}",
+                        "full_path": f"{clean_chapter}/{topic_name}",
                         "title": topic_name
                     })
-        response = {
+        result_payload = {
             "status": "success",
             "chapter": chapter,
             "total": len(topics),
             "topics": sorted(topics, key=lambda x: x["title"])
         }
-        set_cached_json(cache_key, response, ex_seconds=7200)  # 2 hours
-        return response
+        set_cached_json(cache_key, result_payload, ex_seconds=7200)  # 2 hours
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=7200, stale-while-revalidate=120"
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return result_payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/current-affairs/notes")
 def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commission/Election Commission")):
@@ -958,28 +1008,37 @@ def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commis
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/api/current-affairs/note-content")
-def get_ca_note_content(object_key: str = Query(..., description="MinIO object key")):
+def get_ca_note_content(
+    response: Response,
+    object_key: str = Query(..., description="MinIO object key")
+):
     """
     Reads a PIB UPSC smart note from MinIO and compiles it into an
     aesthetically styled, high-readability study dossier for mobile.
     """
+    start_time = time.perf_counter()
     cache_key = f"ca:content:{object_key}"
     cached = get_cached_json(cache_key)
+    
     if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
         return cached
 
     try:
         raw_data = storage.get_json(object_key)
 
         if not isinstance(raw_data, dict):
-            return {
+            fallback_res = {
                 "status": "success",
                 "title": "Smart Note",
                 "object_key": object_key,
                 "markdown": str(raw_data)
             }
+            return fallback_res
 
         headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Study Note"
         
@@ -991,9 +1050,6 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
             except Exception:
                 meta_date = f" • {raw_data['generated_at']}"
 
-        # -------------------------------------------------------------
-        # Aesthetic Mobile Markdown Construction (No broken blockquotes)
-        # -------------------------------------------------------------
         md: list[str] = [
             f"# {headline}\n",
             f"🏷️ GS-II Intelligence Dossier{meta_date} • *Polity Mentor verified*",
@@ -1026,7 +1082,6 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
             md.append("### 🔗 Backward Linkages (Static Syllabus & Articles)\n")
             for item in linkages:
                 clean_item = str(item).replace("⚑", "—").strip()
-                # Format constitutional provisions with clean inline tags
                 if "—" in clean_item:
                     parts = clean_item.split("—", 1)
                     md.append(f"• {parts[0].strip()} — {parts[1].strip()}\n")
@@ -1034,7 +1089,7 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
                     md.append(f"• {clean_item}\n")
             md.append("\n---\n")
 
-        # 5. Prelims Practice Statements (Clean Cards without > blockquotes)
+        # 5. Prelims Practice Statements
         prelims = raw_data.get("prelims_practice_points")
         if isinstance(prelims, list) and prelims:
             md.append("### 🧭 Prelims Drill & Fact Checks\n")
@@ -1043,9 +1098,7 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
                     stmt = item.get("statement", "").strip()
                     correct = item.get("is_correct")
                     exp = item.get("explanation", "").strip()
-                    
                     badge = "✅ CORRECT" if correct is True else ("❌ INCORRECT" if correct is False else "")
-
                     md.append(f"Statement {idx}: {stmt}\n")
                     if badge:
                         md.append(f"• Verdict: {badge}\n")
@@ -1056,23 +1109,27 @@ def get_ca_note_content(object_key: str = Query(..., description="MinIO object k
                     md.append(f"• {str(item).strip()}\n")
             md.append("\n---\n")
 
-# 6. Mains Analytical Practice Question
+        # 6. Mains Analytical Practice Question
         if raw_data.get("mains_question"):
             md.append("### ✍️ Mains Analytical Question\n")
             md.append(f"Practice Question:\n")
             md.append(f"*{raw_data['mains_question'].strip()}*\n")
             md.append("\n*Framing Focus: 250 Words | 15 Marks | Structural Dialectic*")
 
-        response = {
+        result_payload = {
             "status": "success",
             "title": headline,
             "object_key": object_key,
             "markdown": "\n".join(md)
         }
         
-        # Invalidate/cache with new format
-        set_cached_json(cache_key, response, ex_seconds=604800)  # 7 days
-        return response
+        set_cached_json(cache_key, result_payload, ex_seconds=604800)  # 7 days
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return result_payload
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1345,8 +1402,14 @@ async def generate_sitemap(db: Session = Depends(get_db)):
     """
     cache_key = "seo:sitemap:xml"
     cached = get_cached_json(cache_key)
+    
+    headers = {
+        "Cache-Control": "public, max-age=3600, s-maxage=43200, stale-while-revalidate=3600",
+        "X-Cache": "HIT" if (cached and "xml" in cached) else "MISS"
+    }
+
     if cached and "xml" in cached:
-        return Response(content=cached["xml"], media_type="application/xml")
+        return Response(content=cached["xml"], media_type="application/xml", headers=headers)
 
     base_url = "https://politymentor.com"
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
@@ -1365,9 +1428,8 @@ async def generate_sitemap(db: Session = Depends(get_db)):
     add_url(f"{base_url}/prelims-pyqs", priority="0.9", changefreq="weekly")
     add_url(f"{base_url}/syllabus", priority="0.8", changefreq="monthly")
 
-    # 2. Static Constitutional Foundations (Neutral, High-Search GS-II Terms)
+    # 2. Static Constitutional Foundations
     for ch_num, title in LAXMIKANTH_8TH_EDITION.items():
-        # Formats clean slugs: /static-polity/historical-underpinnings-and-evolution
         clean_slug = "".join(c.lower() if c.isalnum() or c == " " else "" for c in title).strip().replace(" ", "-")
         add_url(f"{base_url}/static-polity/{clean_slug}", priority="0.8", changefreq="monthly")
 
@@ -1384,15 +1446,14 @@ async def generate_sitemap(db: Session = Depends(get_db)):
     except Exception as e:
         print(f"Warning: Could not fetch dossiers for sitemap: {e}")
 
-    # Generate pretty-printed XML string
     rough_string = ET.tostring(urlset, "utf-8")
     reparsed = minidom.parseString(rough_string)
     pretty_xml = reparsed.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
 
-    # Cache for 12 hours so the database is not strained by crawler visits
     set_cached_json(cache_key, {"xml": pretty_xml}, ex_seconds=43200)
 
-    return Response(content=pretty_xml, media_type="application/xml")
+    return Response(content=pretty_xml, media_type="application/xml", headers=headers)
+
 
 from fastapi.responses import PlainTextResponse
 
@@ -1509,10 +1570,11 @@ def update_question_report_status(
     rep.status = payload.status.upper()
     db.commit()
     return {"status": "success", "message": f"Question report {report_id} updated to {rep.status}"}
-from src.database.models import ConstitutionalArticleModel
 
+from src.database.models import ConstitutionalArticleModel
 @app.get("/api/admin/articles")
 def list_admin_articles(
+    response: Response,
     search: Optional[str] = Query(None, description="Search by number or title"),
     part: Optional[str] = Query(None, description="Filter by Part number"),
     cluster: Optional[str] = Query(None, description="Filter by doctrine cluster"),
@@ -1520,7 +1582,25 @@ def list_admin_articles(
     offset: int = 0,
     db: Session = Depends(get_db)
 ):
-    """Lists constitutional provisions with metadata and matrix flags."""
+    """Lists constitutional provisions with metadata, matrix flags, and Redis caching."""
+    start_time = time.perf_counter()
+
+    # Deterministic cache key including all query filters
+    clean_search = search.strip().lower() if search else "none"
+    clean_part = part.strip() if part else "all"
+    clean_cluster = cluster.strip() if cluster else "all"
+    cache_key = f"articles:catalogue:c={clean_cluster}:p={clean_part}:s={clean_search}:l={limit}:o={offset}"
+
+    # 1. Check Redis Cache
+    cached = get_cached_json(cache_key)
+    if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return cached
+
+    # 2. Database Fallback (Cache Miss)
     query = db.query(ConstitutionalArticleModel)
 
     if search:
@@ -1545,7 +1625,7 @@ def list_admin_articles(
         .all()
     )
 
-    return {
+    result_data = {
         "status": "success",
         "total": total,
         "articles": [
@@ -1563,14 +1643,42 @@ def list_admin_articles(
         ]
     }
 
+    # 3. Cache for 7 days (604,800s)
+    set_cached_json(cache_key, result_data, ex_seconds=604800)
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    response.headers["Cache-Control"] = "public, max-age=300, s-maxage=604800, stale-while-revalidate=86400"
+    response.headers["X-Cache"] = "MISS"
+    response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+    return result_data
+
+
 @app.get("/api/admin/articles/{article_id}")
-def get_admin_article_detail(article_id: int, db: Session = Depends(get_db)):
+def get_admin_article_detail(
+    article_id: int, 
+    response: Response, 
+    db: Session = Depends(get_db)
+):
     """Fetches complete verbatim text, bare act analysis, 4-epoch trajectory, and matrix."""
+    start_time = time.perf_counter()
+    cache_key = f"articles:detail:{article_id}"
+
+    # 1. Fast Cache Hit Check
+    cached = get_cached_json(cache_key)
+    if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        # Instruct browser & Cloudflare to cache for 7 days, but revalidate if needed
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return cached
+
+    # 2. Database Fallback (Cache Miss)
     article = db.query(ConstitutionalArticleModel).filter(ConstitutionalArticleModel.id == article_id).first()
     if not article:
         raise HTTPException(status_code=404, detail="Constitutional Article not found")
 
-    return {
+    payload = {
         "status": "success",
         "article": {
             "id": article.id,
@@ -1589,6 +1697,63 @@ def get_admin_article_detail(article_id: int, db: Session = Depends(get_db)):
         }
     }
 
+    # 3. Cache for 7 days (604,800s)
+    set_cached_json(cache_key, payload, ex_seconds=604800)
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    response.headers["Cache-Control"] = "public, max-age=300, s-maxage=604800, stale-while-revalidate=86400"
+    response.headers["X-Cache"] = "MISS"
+    response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+    return payload
+
+
+class UpdateArticleRequest(BaseModel):
+    title: Optional[str] = None
+    part_number: Optional[str] = None
+    doctrine_cluster_id: Optional[str] = None
+    verbatim_text: Optional[str] = None
+    bare_act_analysis: Optional[list] = None
+    aspirant_summary: Optional[dict] = None
+    evolution_trajectory: Optional[dict] = None
+    comparative_matrix: Optional[dict] = None
+
+@app.patch("/api/admin/articles/{article_id}")
+def update_admin_article(
+    article_id: int, 
+    payload: UpdateArticleRequest, 
+    db: Session = Depends(get_db)
+):
+    """Updates constitutional article content and purges stale Redis cache immediately."""
+    article = db.query(ConstitutionalArticleModel).filter(ConstitutionalArticleModel.id == article_id).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Constitutional Article not found")
+
+    # Update only fields provided in the request
+    update_data = payload.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(article, field, value)
+
+    article.updated_at = datetime.utcnow()
+    
+    # 1. Commit to PostgreSQL
+    db.commit()
+    db.refresh(article)
+
+    # 2. IMMEDIATE CACHE PURGE (Place it right here!)
+    delete_cached_key(f"articles:detail:{article.id}")
+    if hasattr(article, "article_slug") and article.article_slug:
+        delete_cached_key(f"article:detail:{article.article_slug.strip().lower()}")
+    
+    # Invalidate all filtered list catalogues (parts, clusters, searches)
+    delete_cached_pattern("articles:catalogue:*")
+
+    return {
+        "status": "success", 
+        "message": f"Article #{article_id} updated and cache invalidated.",
+        "article_id": article.id
+    }
+
+
 from src.database.models import PrelimsPYQModel
 from pydantic import BaseModel
 from typing import List
@@ -1602,6 +1767,7 @@ class UpdatePYQMappingRequest(BaseModel):
 
 @app.get("/api/admin/pyqs")
 def list_admin_pyqs(
+    response: Response,
     search: Optional[str] = Query(None, description="Search question text or explanation"),
     year: Optional[int] = Query(None, description="Filter by exam year"),
     chapter_number: Optional[int] = Query(None, description="Filter by Laxmikanth chapter (1-92)"),
@@ -1610,7 +1776,23 @@ def list_admin_pyqs(
     offset: int = 0,
     db: Session = Depends(get_db)
 ):
-    """Lists Prelims PYQs with article array containment and taxonomy filters."""
+    """Lists Prelims PYQs with article array containment, taxonomy filters, and Redis caching."""
+    start_time = time.perf_counter()
+
+    # Deterministic query key across all active filters
+    clean_search = search.strip().lower() if search else "none"
+    cache_key = f"pyqs:catalogue:y={year or 'all'}:ch={chapter_number or 'all'}:art={article_number or 'all'}:s={clean_search}:l={limit}:o={offset}"
+
+    # 1. Fast Cache Hit Check
+    cached = get_cached_json(cache_key)
+    if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return cached
+
+    # 2. Database Fallback (Cache Miss)
     query = db.query(PrelimsPYQModel)
 
     if search:
@@ -1637,7 +1819,7 @@ def list_admin_pyqs(
         .all()
     )
 
-    return {
+    result_data = {
         "status": "success",
         "total": total,
         "pyqs": [
@@ -1659,13 +1841,22 @@ def list_admin_pyqs(
         ]
     }
 
+    # 3. Cache for 7 days (604,800s)
+    set_cached_json(cache_key, result_data, ex_seconds=604800)
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    response.headers["Cache-Control"] = "public, max-age=300, s-maxage=604800, stale-while-revalidate=86400"
+    response.headers["X-Cache"] = "MISS"
+    response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+    return result_data
+
 @app.patch("/api/admin/pyqs/{pyq_id}")
 def update_pyq_metadata(
     pyq_id: int, 
     payload: UpdatePYQMappingRequest, 
     db: Session = Depends(get_db)
 ):
-    """Updates taxonomy chapter links, difficulty, or mapped constitutional article IDs."""
+    """Updates taxonomy chapter links, difficulty, or mapped constitutional article IDs and purges cache."""
     pyq = db.query(PrelimsPYQModel).filter(PrelimsPYQModel.id == pyq_id).first()
     if not pyq:
         raise HTTPException(status_code=404, detail="PYQ item not found")
@@ -1683,7 +1874,16 @@ def update_pyq_metadata(
 
     db.commit()
     db.refresh(pyq)
-    return {"status": "success", "message": f"PYQ #{pyq.id} updated"}
+
+    # --- INSTANT CACHE INVALIDATION ---
+    # 1. Purge all cached PYQ list filter combinations
+    delete_cached_pattern("pyqs:catalogue:*")
+    # 2. Also purge any module drill caches built in blueprint.py
+    delete_cached_pattern("blueprint:drill:*")
+    delete_cached_pattern("blueprint:prelims:*")
+
+    return {"status": "success", "message": f"PYQ #{pyq.id} updated and caches purged"}
+
 
 from src.database.models import IngestionRun, DocumentChunkModel
 from sqlalchemy import desc
@@ -1773,72 +1973,40 @@ def list_recent_vector_chunks(
 from src.database.models import IssueDossierModel, IssueGraphEdgeModel
 from sqlalchemy.orm import selectinload
 
-@app.get("/api/admin/dossiers")
-def get_admin_dossiers(
-    search: Optional[str] = Query(None, description="Search dossiers by title, slug, or chapter"),
-    status: Optional[str] = Query(None, description="active, archived, etc."),
-    limit: int = 50,
-    offset: int = 0,
+@app.patch("/api/admin/pyqs/{pyq_id}")
+def update_pyq_metadata(
+    pyq_id: int, 
+    payload: UpdatePYQMappingRequest, 
     db: Session = Depends(get_db)
 ):
-    """
-    Administrative overview for living constitutional topic dossiers,
-    prelims factsheet summaries, and connected evolutionary perspective edges.
-    """
-    query = db.query(IssueDossierModel).options(selectinload(IssueDossierModel.edges))
+    """Updates taxonomy chapter links, difficulty, or mapped constitutional article IDs and purges cache."""
+    pyq = db.query(PrelimsPYQModel).filter(PrelimsPYQModel.id == pyq_id).first()
+    if not pyq:
+        raise HTTPException(status_code=404, detail="PYQ item not found")
 
-    if search:
-        pat = f"%{search.strip()}%"
-        query = query.filter(
-            or_(
-                IssueDossierModel.title.ilike(pat),
-                IssueDossierModel.chapter_name.ilike(pat),
-                IssueDossierModel.issue_slug.ilike(pat)
-            )
-        )
-    if status:
-        query = query.filter(IssueDossierModel.status == status.strip().lower())
+    if payload.chapter_number is not None:
+        pyq.chapter_number = payload.chapter_number
+    if payload.chapter_name is not None:
+        pyq.chapter_name = payload.chapter_name.strip()
+    if payload.mapped_articles is not None:
+        pyq.mapped_articles = sorted(list(set(payload.mapped_articles)))
+    if payload.difficulty_level is not None:
+        pyq.difficulty_level = payload.difficulty_level.strip()
+    if payload.is_conceptual is not None:
+        pyq.is_conceptual = payload.is_conceptual
 
-    total = query.count()
-    dossiers = (
-        query.order_by(IssueDossierModel.last_updated_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
+    db.commit()
+    db.refresh(pyq)
 
-    data = []
-    for d in dossiers:
-        data.append({
-            "id": str(d.issue_id),
-            "title": d.title,
-            "issue_slug": d.issue_slug,
-            "chapter_name": d.chapter_name,
-            "status": d.status,
-            "article_count": d.article_count,
-            "canonical_summary": d.canonical_summary,
-            "prelims_factsheet": d.prelims_factsheet or {},
-            "mains_framework": d.mains_framework or {},
-            "first_detected_at": d.first_detected_at.isoformat() if d.first_detected_at else None,
-            "last_updated_at": d.last_updated_at.isoformat() if d.last_updated_at else None,
-            "edges_count": len(d.edges) if d.edges else 0,
-            "perspectives": [
-                {
-                    "publication": e.publication,
-                    "event_date": str(e.event_date) if hasattr(e, 'event_date') else None,
-                    "perspective_stance": e.perspective_stance,
-                    "core_claim": e.core_claim,
-                    "legal_anchors": e.legal_anchors or []
-                }
-                for e in (d.edges if d.edges else [])
-            ]
-        })
+    # --- INSTANT CACHE INVALIDATION ---
+    # 1. Purge all cached PYQ list filter combinations
+    delete_cached_pattern("pyqs:catalogue:*")
+    # 2. Also purge any module drill caches built in blueprint.py
+    delete_cached_pattern("blueprint:drill:*")
+    delete_cached_pattern("blueprint:prelims:*")
 
-    return {
-        "status": "success",
-        "total": total,
-        "dossiers": data
-    }
+    return {"status": "success", "message": f"PYQ #{pyq.id} updated and caches purged"}
+
 
 import os
 import secrets
