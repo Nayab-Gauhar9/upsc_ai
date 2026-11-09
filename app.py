@@ -2205,62 +2205,79 @@ class AdminSmartNoteUpdateRequest(BaseModel):
 
 @app.get("/api/admin/smart-notes/queue")
 def list_admin_smart_notes_queue(
-    limit: int = 50,
-    chapter: Optional[str] = Query(None, description="Filter by chapter name"),
+    limit: int = 250,
+    chapter: Optional[str] = Query(None, description="Filter by canonical chapter name"),
+    sort_by: str = Query("recent", description="'recent' (descending PRID) or 'raw'")
 ):
     """
-    Lists generated smart notes directly from MinIO/R2 under pib/smart_notes/
-    for administrative review and discrepancy fixing.
+    Lists smart notes from R2 with descending PRID sorting and chapter filtering.
     """
     try:
-        prefix = SMART_NOTES_PREFIX
-        if chapter:
-            prefix = f"{SMART_NOTES_PREFIX}{chapter.strip('/')}/"
+        search_prefix = SMART_NOTES_PREFIX
+        if chapter and chapter.strip() not in ("All", ""):
+            search_prefix = f"{SMART_NOTES_PREFIX}{chapter.strip('/')}"
 
-        objects = list(storage.client.list_objects(storage.bucket, prefix=prefix, recursive=True))
+        raw_objects = []
+        if hasattr(storage, "list_objects"):
+            try:
+                raw_objects = list(storage.list_objects(search_prefix))
+            except TypeError:
+                raw_objects = list(storage.list_objects(search_prefix, recursive=True))
+        elif hasattr(storage, "client"):
+            raw_objects = list(
+                storage.client.list_objects(storage.bucket, prefix=search_prefix, recursive=True)
+            )
+
         notes = []
+        available_chapters = set()
 
-        for obj in objects:
-            key = obj.object_name
-            if not obj.is_dir and key.endswith(".json") and "smart_notes_" in key:
-                parts = key.split("/")
-                # Pattern: pib/smart_notes/<chapter>/<topic>/smart_notes_<prid>.json
-                ch_name = parts[2] if len(parts) >= 5 else "General"
-                tp_name = parts[3] if len(parts) >= 5 else "Current Affairs"
-                filename = parts[-1]
-                prid = filename.replace("smart_notes_", "").replace(".json", "")
+        for obj in raw_objects:
+            key = getattr(obj, "object_name", None) or getattr(obj, "key", "")
+            if not key or key.endswith("/") or not key.endswith(".json") or "smart_notes_" not in key:
+                continue
 
-                headline = f"PIB Smart Note #{prid}"
-                try:
-                    data = storage.get_json(key)
-                    if isinstance(data, dict):
-                        headline = data.get("headline") or data.get("title") or headline
-                except Exception:
-                    pass
+            parts = key.split("/")
+            # pib/smart_notes/<chapter>/<topic>/smart_notes_<prid>.json
+            ch_name = parts[2] if len(parts) >= 5 else "General"
+            tp_name = parts[3] if len(parts) >= 5 else "Current Affairs"
+            filename = parts[-1]
+            prid_str = filename.replace("smart_notes_", "").replace(".json", "")
 
-                notes.append({
-                    "object_key": key,
-                    "filename": filename,
-                    "prid": prid,
-                    "chapter": ch_name,
-                    "topic": tp_name,
-                    "headline": headline,
-                    "size_kb": round(obj.size / 1024, 2) if hasattr(obj, "size") and obj.size else 0,
-                    "last_modified": obj.last_modified.isoformat() if hasattr(obj, "last_modified") and obj.last_modified else None,
-                })
+            available_chapters.add(ch_name)
 
-                if len(notes) >= limit:
-                    break
+            headline = f"PIB Note #{prid_str}"
+            try:
+                data = storage.get_json(key)
+                if isinstance(data, dict):
+                    headline = data.get("headline") or data.get("title") or headline
+            except Exception:
+                pass
+
+            notes.append({
+                "object_key": key,
+                "filename": filename,
+                "prid": prid_str,
+                "prid_num": int(prid_str) if prid_str.isdigit() else 0,
+                "chapter": ch_name,
+                "topic": tp_name,
+                "headline": headline,
+                "size_kb": round((getattr(obj, "size", 0) or 0) / 1024, 2),
+                "last_modified": getattr(obj, "last_modified", None),
+            })
+
+        # Sort: Highest PRID first (most recent PIB releases)
+        if sort_by == "recent":
+            notes.sort(key=lambda x: x["prid_num"], reverse=True)
 
         return {
             "status": "success",
             "total": len(notes),
-            "items": notes
+            "chapters": sorted(list(available_chapters)),
+            "items": notes[:limit]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to scan R2 smart notes: {str(e)}")
-
-
+    
 @app.get("/api/admin/smart-notes/detail")
 def get_admin_smart_note_detail(
     object_key: str = Query(..., description="MinIO/R2 object key e.g. pib/smart_notes/..."),
@@ -2287,6 +2304,8 @@ def get_admin_smart_note_detail(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+import io
+import json
 
 @app.put("/api/admin/smart-notes/save")
 def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
@@ -2295,23 +2314,28 @@ def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
     all downstream Redis caches so changes take effect immediately on web & app.
     """
     try:
-        # 1. Fetch current object from R2
-        current_data = storage.get_json(payload.object_key)
-        if not isinstance(current_data, dict):
+        # 1. Fetch current object from R2 safely
+        current_data = {}
+        try:
+            existing = storage.get_json(payload.object_key)
+            if isinstance(existing, dict):
+                current_data = existing
+        except Exception:
             current_data = {}
 
-        # 2. Apply updates
+        # 2. Merge updates
         if payload.raw_json_override:
             updated_data = payload.raw_json_override
         else:
             updated_data = dict(current_data)
             field_mappings = {
                 "headline": payload.headline,
+                "title": payload.headline,
                 "sub_headline": payload.sub_headline,
                 "pib_executive_context": payload.pib_executive_context,
                 "strategic_upsc_value": payload.strategic_upsc_value,
-                "summary": payload.summary,
-                "why_it_matters": payload.why_it_matters,
+                "summary": payload.summary or payload.pib_executive_context,
+                "why_it_matters": payload.why_it_matters or payload.strategic_upsc_value,
                 "smart_notes": payload.smart_notes,
                 "backward_linkages": payload.backward_linkages,
                 "prelims_practice_points": payload.prelims_practice_points,
@@ -2325,10 +2349,24 @@ def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
 
         updated_data["last_manually_edited_at"] = datetime.utcnow().isoformat()
 
-        # 3. Commit update to MinIO / Cloudflare R2
-        storage.put_json(payload.object_key, updated_data)
+        # 3. Direct R2 / MinIO Byte Stream Upload
+        json_bytes = json.dumps(updated_data, ensure_ascii=False, indent=2).encode("utf-8")
+        data_stream = io.BytesIO(json_bytes)
 
-        # 4. Instant Cache Invalidation across Redis
+        if hasattr(storage, "upload_json"):
+            storage.upload_json(payload.object_key, updated_data)
+        elif hasattr(storage, "client"):
+            storage.client.put_object(
+                bucket_name=storage.bucket,
+                object_name=payload.object_key,
+                data=data_stream,
+                length=len(json_bytes),
+                content_type="application/json"
+            )
+        else:
+            raise AttributeError("Unable to locate S3 upload client on MinIOStorage instance")
+
+        # 4. Invalidate Redis Caches
         delete_cached_key(f"ca:content:v4:{payload.object_key}")
         delete_cached_key("ca:notes:latest")
         delete_cached_pattern("ca:notes:*")
