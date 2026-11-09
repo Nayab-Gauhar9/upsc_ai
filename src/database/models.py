@@ -906,3 +906,58 @@ class ContentReport(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+
+class SocialCampaignQueue(Base):
+    __tablename__ = "social_campaign_queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("constitutional_articles.id", ondelete="CASCADE"), nullable=True)
+    article_number: Mapped[str] = mapped_column(String(50), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    # State machine: PENDING_APPROVAL, APPROVED, REJECTED, PUBLISHED
+    status: Mapped[str] = mapped_column(String(32), default="PENDING_APPROVAL", nullable=False)
+    
+    # Stores the synthesized 5-slide JSON data
+    slides_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    
+    # Static paths/URLs to the rendered 1080x1350 PNG slides
+    image_paths: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+class PrelimsTrapMatrix(Base):
+    __tablename__ = "prelims_trap_matrices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)  # 'ARTICLE', 'DOSSIER', 'PYQ_MUTATION'
+    source_ref_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    topic: Mapped[str] = mapped_column(String(255), nullable=False)
+    chapter_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    
+    # Modern trend formats: 'STATEMENT_I_II', 'HOW_MANY', 'STANDARD_BRACKET'
+    question_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    question_stem: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    statements_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    options: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    correct_option: Mapped[str] = mapped_column(String(2), nullable=False)
+    
+    trap_archetype: Mapped[str] = mapped_column(String(64), nullable=False)
+    conceptual_analysis: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    elimination_heuristic: Mapped[str] = mapped_column(Text, nullable=False)
+    source_citation: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    social_campaign_id: Mapped[int | None] = mapped_column(
+        ForeignKey("social_campaign_queue.id", ondelete="SET NULL"),
+        nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )

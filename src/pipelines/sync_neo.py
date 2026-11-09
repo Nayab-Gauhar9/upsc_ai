@@ -21,24 +21,13 @@ local_engine = create_engine(LOCAL_DB_URL)
 neon_engine = create_engine(NEON_DB_URL)
 
 TABLE_CONFIG = [
-    # Core User & Tracking Models
-    {"name": "users", "pk": "id", "seq": "users_id_seq", "upsert": False},
-    {"name": "user_sessions", "pk": "id", "seq": "user_sessions_id_seq", "upsert": False},
+    # Core Tracking Models
     {"name": "ingestion_runs", "pk": "run_id", "seq": None, "upsert": False},
     {"name": "document_chunks", "pk": "id", "seq": "document_chunks_id_seq", "upsert": False},
-    {"name": "user_chapter_progress", "pk": "id", "seq": "user_chapter_progress_id_seq", "upsert": False},
-    {"name": "user_notes", "pk": "id", "seq": "user_notes_id_seq", "upsert": False},
-    {"name": "user_query_history", "pk": "id", "seq": "user_query_history_id_seq", "upsert": False},
     
     # Knowledge Graph Models
     {"name": "issue_dossiers", "pk": "issue_id", "seq": None, "upsert": True},
     {"name": "issue_graph_edges", "pk": "edge_id", "seq": None, "upsert": False},
-    {
-        "name": "constitutional_articles",
-        "pk": "id",
-        "seq": "constitutional_articles_id_seq",
-        "upsert": True,
-    },
 
     # Daily Drill Sets & Questions (Parent table first, then child)
     {
@@ -51,20 +40,6 @@ TABLE_CONFIG = [
         "name": "daily_challenge_questions",
         "pk": "id",
         "seq": None,
-        "upsert": True,
-    },
-
-    # Issue Reporting & Editorial Feedback
-    {
-        "name": "question_reports",
-        "pk": "id",
-        "seq": None,
-        "upsert": True,
-    },
-    {
-        "name": "content_reports",
-        "pk": "id",
-        "seq": "content_reports_id_seq",
         "upsert": True,
     },
 ]

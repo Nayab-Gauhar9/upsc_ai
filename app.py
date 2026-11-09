@@ -1014,13 +1014,13 @@ def get_ca_note_content(
     object_key: str = Query(..., description="MinIO object key")
 ):
     """
-    Reads a PIB UPSC smart note from MinIO and compiles it into an
-    aesthetically styled, high-readability study dossier for mobile.
+    Parses a PIB UPSC Smart Note from MinIO into clean, modular,
+    atomic JSON fields for custom FlutterFlow UI components.
     """
     start_time = time.perf_counter()
-    cache_key = f"ca:content:{object_key}"
+    cache_key = f"ca:content:v4:{object_key}"
     cached = get_cached_json(cache_key)
-    
+
     if cached:
         duration_ms = (time.perf_counter() - start_time) * 1000
         response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
@@ -1032,107 +1032,119 @@ def get_ca_note_content(
         raw_data = storage.get_json(object_key)
 
         if not isinstance(raw_data, dict):
-            fallback_res = {
-                "status": "success",
-                "title": "Smart Note",
-                "object_key": object_key,
-                "markdown": str(raw_data)
+            return {
+                "status": "error",
+                "message": "Invalid note format in storage",
+                "object_key": object_key
             }
-            return fallback_res
 
         headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Study Note"
-        
+
+        # Format publication date
         meta_date = ""
-        if "generated_at" in raw_data and raw_data["generated_at"]:
+        raw_date = raw_data.get("generated_at")
+        if raw_date:
             try:
-                dt = datetime.fromisoformat(str(raw_data["generated_at"]))
-                meta_date = f" • {dt.strftime('%d %B %Y')}"
+                dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                meta_date = dt.strftime("%d %B %Y")
             except Exception:
-                meta_date = f" • {raw_data['generated_at']}"
+                meta_date = str(raw_date)
 
-        md: list[str] = [
-            f"# {headline}\n",
-            f"🏷️ GS-II Intelligence Dossier{meta_date} • *Polity Mentor verified*",
-            "\n---\n"
-        ]
+        # 1. Summary & Context
+        summary_text = raw_data.get("summary", "").strip()
+        why_it_matters_text = raw_data.get("why_it_matters", "").strip()
 
-        # 1. Executive Summary
-        if raw_data.get("summary"):
-            md.append("### 📌 Executive Summary\n")
-            md.append(f"{raw_data['summary'].strip()}\n")
-            md.append("\n---\n")
+        # 2. Highlights (Separated into title + body objects)
+        raw_highlights = raw_data.get("smart_notes") or []
+        highlights_list = []
+        for idx, pt in enumerate(raw_highlights, start=1):
+            clean_pt = str(pt).strip().lstrip("•").lstrip("-").strip()
+            if ":" in clean_pt:
+                h_title, h_body = clean_pt.split(":", 1)
+                highlights_list.append({
+                    "title": h_title.strip(),
+                    "body": h_body.strip()
+                })
+            else:
+                highlights_list.append({
+                    "title": f"Key Point {idx}",
+                    "body": clean_pt
+                })
 
-        # 2. Why It Matters for UPSC
-        if raw_data.get("why_it_matters"):
-            md.append("### 💡 Why It Matters for UPSC\n")
-            md.append(f"{raw_data['why_it_matters'].strip()}\n")
-            md.append("\n---\n")
+        # 3. Backward Linkages (Separated into anchor + description)
+        raw_linkages = raw_data.get("backward_linkages") or []
+        linkages_list = []
+        for item in raw_linkages:
+            clean_item = str(item).replace("⚑", "—").strip().lstrip("•").lstrip("-").strip()
+            separator = "—" if "—" in clean_item else ("-" if "-" in clean_item else None)
+            
+            if separator and len(clean_item.split(separator)) == 2:
+                parts = clean_item.split(separator, 1)
+                linkages_list.append({
+                    "anchor": parts[0].strip(),
+                    "description": parts[1].strip()
+                })
+            else:
+                linkages_list.append({
+                    "anchor": clean_item,
+                    "description": "Constitutional Foundation / Statutory Linkage"
+                })
 
-        # 3. Smart Notes (Key Exam Highlights)
-        smart_notes = raw_data.get("smart_notes")
-        if isinstance(smart_notes, list) and smart_notes:
-            md.append("### 📝 Smart Notes (Key Exam Highlights)\n")
-            for pt in smart_notes:
-                md.append(f"• {str(pt).strip()}\n")
-            md.append("\n---\n")
+        # 4. Prelims Drill (Separated statement cards)
+        raw_prelims = raw_data.get("prelims_practice_points") or []
+        drill_list = []
+        for idx, item in enumerate(raw_prelims, start=1):
+            if isinstance(item, dict):
+                is_corr = item.get("is_correct")
+                drill_list.append({
+                    "statement_number": idx,
+                    "statement": item.get("statement", "").strip(),
+                    "is_correct": is_corr,
+                    "verdict_label": "CORRECT" if is_corr is True else ("INCORRECT" if is_corr is False else "NEUTRAL"),
+                    "explanation": item.get("explanation", "").strip()
+                })
+            else:
+                drill_list.append({
+                    "statement_number": idx,
+                    "statement": str(item).strip(),
+                    "is_correct": None,
+                    "verdict_label": "INFO",
+                    "explanation": ""
+                })
 
-        # 4. Backward Linkages (Static Syllabus & Case Laws)
-        linkages = raw_data.get("backward_linkages")
-        if isinstance(linkages, list) and linkages:
-            md.append("### 🔗 Backward Linkages (Static Syllabus & Articles)\n")
-            for item in linkages:
-                clean_item = str(item).replace("⚑", "—").strip()
-                if "—" in clean_item:
-                    parts = clean_item.split("—", 1)
-                    md.append(f"• {parts[0].strip()} — {parts[1].strip()}\n")
-                else:
-                    md.append(f"• {clean_item}\n")
-            md.append("\n---\n")
-
-        # 5. Prelims Practice Statements
-        prelims = raw_data.get("prelims_practice_points")
-        if isinstance(prelims, list) and prelims:
-            md.append("### 🧭 Prelims Drill & Fact Checks\n")
-            for idx, item in enumerate(prelims, start=1):
-                if isinstance(item, dict):
-                    stmt = item.get("statement", "").strip()
-                    correct = item.get("is_correct")
-                    exp = item.get("explanation", "").strip()
-                    badge = "✅ CORRECT" if correct is True else ("❌ INCORRECT" if correct is False else "")
-                    md.append(f"Statement {idx}: {stmt}\n")
-                    if badge:
-                        md.append(f"• Verdict: {badge}\n")
-                    if exp:
-                        md.append(f"• Analysis: {exp}\n")
-                    md.append("")
-                else:
-                    md.append(f"• {str(item).strip()}\n")
-            md.append("\n---\n")
-
-        # 6. Mains Analytical Practice Question
-        if raw_data.get("mains_question"):
-            md.append("### ✍️ Mains Analytical Question\n")
-            md.append(f"Practice Question:\n")
-            md.append(f"*{raw_data['mains_question'].strip()}*\n")
-            md.append("\n*Framing Focus: 250 Words | 15 Marks | Structural Dialectic*")
+        # 5. Mains Analytical Question
+        mains_text = raw_data.get("mains_question", "").strip()
 
         result_payload = {
             "status": "success",
             "title": headline,
             "object_key": object_key,
-            "markdown": "\n".join(md)
+            "date": meta_date,
+            "upsc_relevance": raw_data.get("upsc_relevance_mains", ""),
+            "content": {
+                "summary": summary_text,
+                "why_it_matters": why_it_matters_text,
+                "highlights": highlights_list,
+                "linkages": linkages_list,
+                "drill": drill_list,
+                "mains": {
+                    "question": mains_text,
+                    "word_limit": "250 Words",
+                    "marks": "15 Marks"
+                }
+            }
         }
-        
+
         set_cached_json(cache_key, result_payload, ex_seconds=604800)  # 7 days
-        
+
         duration_ms = (time.perf_counter() - start_time) * 1000
         response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
         response.headers["X-Cache"] = "MISS"
         response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
         return result_payload
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 @app.get("/api/notes")
@@ -1342,52 +1354,96 @@ from src.services.pdf_generator import generate_pdf_from_markdown
 
 @app.get("/api/current-affairs/download-pdf")
 async def download_smart_note_pdf(object_key: str = Query(..., description="MinIO object key")):
-    """Generates and streams a downloadable PDF for any smart note directly from MinIO."""
-    # Reuse your existing get_ca_note_content logic
-    note_data = get_ca_note_content(object_key=object_key)
-    title = note_data.get("title", "UPSC_Smart_Note")
-    markdown_text = note_data.get("markdown", "")
+    """
+    Generates and streams a print-calibrated, slate-and-brass PDF dossier 
+    directly from the MinIO smart note object.
+    """
+    try:
+        raw_data = storage.get_json(object_key)
+        if not isinstance(raw_data, dict):
+            raise HTTPException(status_code=404, detail="Note not found or invalid format in storage")
 
-    pdf_stream = generate_pdf_from_markdown(title=title, markdown_content=markdown_text)
+        title = raw_data.get("headline") or raw_data.get("title") or "UPSC Current Affairs Dossier"
+        
+        # Build clean markdown specifically formatted for the new PDF engine
+        lines = [
+            f"# {title}\n",
+            "**UPSC Civil Services Examination • GS-II Intelligence Dossier**\n",
+            "---\n"
+        ]
 
-    safe_filename = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).rstrip()
-    encoded_filename = urllib.parse.quote(f"{safe_filename[:40]}.pdf")
+        # 1. Executive Summary
+        if raw_data.get("summary"):
+            lines.append("## Executive Summary\n")
+            lines.append(f"{raw_data['summary'].strip()}\n\n---\n")
 
-    return StreamingResponse(
-        pdf_stream,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"
-        }
-    )
+        # 2. Why It Matters
+        if raw_data.get("why_it_matters"):
+            lines.append("## Why It Matters for UPSC\n")
+            lines.append(f"> {raw_data['why_it_matters'].strip()}\n\n---\n")
 
-@app.get("/api/notes/{note_id}/download-pdf")
-async def download_user_note_pdf(
-    note_id: int, 
-    firebase_uid: str = Query(...), 
-    db: Session = Depends(get_db)
-):
-    """Generates and streams a downloadable PDF from a saved UserNote."""
-    user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        # 3. Key Highlights
+        smart_notes = raw_data.get("smart_notes")
+        if isinstance(smart_notes, list) and smart_notes:
+            lines.append("## Strategic Takeaways & Key Facts\n")
+            for pt in smart_notes:
+                lines.append(f"* {str(pt).strip()}")
+            lines.append("\n---\n")
 
-    note = db.query(UserNote).filter(UserNote.id == note_id, UserNote.user_id == user.id).first()
-    if not note:
-        raise HTTPException(status_code=404, detail="Note not found")
+        # 4. Backward Linkages / Constitutional Anchors
+        linkages = raw_data.get("backward_linkages")
+        if isinstance(linkages, list) and linkages:
+            lines.append("## Backward Linkages & Constitutional Anchors\n")
+            for item in linkages:
+                lines.append(f"* {str(item).strip()}")
+            lines.append("\n---\n")
 
-    pdf_stream = generate_pdf_from_markdown(title=note.title, markdown_content=note.content)
+        # 5. Prelims Drill & Fact Checks
+        prelims = raw_data.get("prelims_practice_points")
+        if isinstance(prelims, list) and prelims:
+            lines.append("## Prelims Drill & Boundary Traps\n")
+            for idx, item in enumerate(prelims, start=1):
+                if isinstance(item, dict):
+                    stmt = item.get("statement", "").strip()
+                    correct = item.get("is_correct")
+                    exp = item.get("explanation", "").strip()
+                    badge = "**[CORRECT]**" if correct is True else ("**[INCORRECT]**" if correct is False else "")
+                    lines.append(f"**Statement {idx}:** {stmt}\n")
+                    if badge:
+                        lines.append(f"* Verdict: {badge}\n")
+                    if exp:
+                        lines.append(f"* Forensic Analysis: {exp}\n")
+                else:
+                    lines.append(f"* {str(item).strip()}")
+            lines.append("\n---\n")
 
-    safe_filename = "".join(c for c in note.title if c.isalnum() or c in (" ", "_", "-")).rstrip()
-    encoded_filename = urllib.parse.quote(f"{safe_filename[:40]}.pdf")
+        # 6. Mains Analytical Question
+        if raw_data.get("mains_question"):
+            lines.append("## Mains Answer-Building Framework\n")
+            lines.append(f"> **Practice Question (250 Words | 15 Marks):**  \n> *{raw_data['mains_question'].strip()}*\n")
 
-    return StreamingResponse(
-        pdf_stream,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}"
-        }
-    )
+        markdown_content = "\n".join(lines)
+
+        # Generate the styled PDF binary stream
+        pdf_stream = generate_pdf_from_markdown(title=title, markdown_content=markdown_content)
+
+        # URL-encode filename to support UTF-8 special characters safely
+        safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()
+        encoded_filename = urllib.parse.quote(f"{safe_title[:45]}.pdf")
+
+        return StreamingResponse(
+            pdf_stream,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}",
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 from fastapi import Response
 import xml.etree.ElementTree as ET
