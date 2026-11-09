@@ -2047,6 +2047,12 @@ def purge_system_cache(tag: str = Query(..., description="blueprint, articles, p
         cleared += delete_cached_pattern("dossiers:*")
         delete_cached_key("seo:sitemap:xml")
         cleared += 1
+    elif clean_tag == "smart-notes":
+        cleared += delete_cached_pattern("ca:content:*")
+        cleared += delete_cached_pattern("ca:notes:*")
+        cleared += delete_cached_pattern("ca:topics:*")
+        delete_cached_key("ca:notes:latest")
+        cleared += 1
     else:
         raise HTTPException(status_code=400, detail=f"Unrecognized cache tag '{tag}'")
 
@@ -2176,6 +2182,164 @@ def admin_login(payload: AdminLoginRequest):
         "status": "success",
         "token": ADMIN_SECRET_KEY
     }
+
+class AdminSmartNoteUpdateRequest(BaseModel):
+    object_key: str
+    headline: Optional[str] = None
+    sub_headline: Optional[str] = None
+    pib_executive_context: Optional[str] = None
+    strategic_upsc_value: Optional[str] = None
+    summary: Optional[str] = None
+    why_it_matters: Optional[str] = None
+    smart_notes: Optional[list] = None
+    backward_linkages: Optional[list] = None
+    prelims_practice_points: Optional[list] = None
+    mains_question: Optional[str] = None
+    mains_analytical_question: Optional[str] = None
+    raw_json_override: Optional[dict] = None
+    re_render_slides: Optional[bool] = False
+
+# ---------------------------------------------------------
+# Admin Smart Notes Studio & R2 Quality Cockpit Endpoints
+# ---------------------------------------------------------
+
+@app.get("/api/admin/smart-notes/queue")
+def list_admin_smart_notes_queue(
+    limit: int = 50,
+    chapter: Optional[str] = Query(None, description="Filter by chapter name"),
+):
+    """
+    Lists generated smart notes directly from MinIO/R2 under pib/smart_notes/
+    for administrative review and discrepancy fixing.
+    """
+    try:
+        prefix = SMART_NOTES_PREFIX
+        if chapter:
+            prefix = f"{SMART_NOTES_PREFIX}{chapter.strip('/')}/"
+
+        objects = list(storage.client.list_objects(storage.bucket, prefix=prefix, recursive=True))
+        notes = []
+
+        for obj in objects:
+            key = obj.object_name
+            if not obj.is_dir and key.endswith(".json") and "smart_notes_" in key:
+                parts = key.split("/")
+                # Pattern: pib/smart_notes/<chapter>/<topic>/smart_notes_<prid>.json
+                ch_name = parts[2] if len(parts) >= 5 else "General"
+                tp_name = parts[3] if len(parts) >= 5 else "Current Affairs"
+                filename = parts[-1]
+                prid = filename.replace("smart_notes_", "").replace(".json", "")
+
+                headline = f"PIB Smart Note #{prid}"
+                try:
+                    data = storage.get_json(key)
+                    if isinstance(data, dict):
+                        headline = data.get("headline") or data.get("title") or headline
+                except Exception:
+                    pass
+
+                notes.append({
+                    "object_key": key,
+                    "filename": filename,
+                    "prid": prid,
+                    "chapter": ch_name,
+                    "topic": tp_name,
+                    "headline": headline,
+                    "size_kb": round(obj.size / 1024, 2) if hasattr(obj, "size") and obj.size else 0,
+                    "last_modified": obj.last_modified.isoformat() if hasattr(obj, "last_modified") and obj.last_modified else None,
+                })
+
+                if len(notes) >= limit:
+                    break
+
+        return {
+            "status": "success",
+            "total": len(notes),
+            "items": notes
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to scan R2 smart notes: {str(e)}")
+
+
+@app.get("/api/admin/smart-notes/detail")
+def get_admin_smart_note_detail(
+    object_key: str = Query(..., description="MinIO/R2 object key e.g. pib/smart_notes/..."),
+):
+    """
+    Loads verbatim smart note JSON data directly from R2 to populate the studio editor.
+    """
+    try:
+        data = storage.get_json(object_key)
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=404, detail="Smart note not found or corrupt in storage")
+
+        parts = object_key.split("/")
+        return {
+            "status": "success",
+            "object_key": object_key,
+            "chapter": parts[2] if len(parts) >= 5 else "General",
+            "topic": parts[3] if len(parts) >= 5 else "Polity",
+            "prid": parts[-1].replace("smart_notes_", "").replace(".json", ""),
+            "data": data,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/admin/smart-notes/save")
+def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
+    """
+    Overwrites the amended smart note JSON in MinIO/R2 and clears
+    all downstream Redis caches so changes take effect immediately on web & app.
+    """
+    try:
+        # 1. Fetch current object from R2
+        current_data = storage.get_json(payload.object_key)
+        if not isinstance(current_data, dict):
+            current_data = {}
+
+        # 2. Apply updates
+        if payload.raw_json_override:
+            updated_data = payload.raw_json_override
+        else:
+            updated_data = dict(current_data)
+            field_mappings = {
+                "headline": payload.headline,
+                "sub_headline": payload.sub_headline,
+                "pib_executive_context": payload.pib_executive_context,
+                "strategic_upsc_value": payload.strategic_upsc_value,
+                "summary": payload.summary,
+                "why_it_matters": payload.why_it_matters,
+                "smart_notes": payload.smart_notes,
+                "backward_linkages": payload.backward_linkages,
+                "prelims_practice_points": payload.prelims_practice_points,
+                "mains_question": payload.mains_question or payload.mains_analytical_question,
+                "mains_analytical_question": payload.mains_analytical_question or payload.mains_question,
+            }
+
+            for key, val in field_mappings.items():
+                if val is not None:
+                    updated_data[key] = val
+
+        updated_data["last_manually_edited_at"] = datetime.utcnow().isoformat()
+
+        # 3. Commit update to MinIO / Cloudflare R2
+        storage.put_json(payload.object_key, updated_data)
+
+        # 4. Instant Cache Invalidation across Redis
+        delete_cached_key(f"ca:content:v4:{payload.object_key}")
+        delete_cached_key("ca:notes:latest")
+        delete_cached_pattern("ca:notes:*")
+
+        return {
+            "status": "success",
+            "message": "Smart Note successfully amended in R2 and cache cleared",
+            "object_key": payload.object_key,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to persist smart note to R2: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

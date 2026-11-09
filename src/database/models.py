@@ -159,6 +159,31 @@ class User(Base):
         nullable=True,
     )
 
+    # --- Subscription Fields ---
+    subscription_tier: Mapped[str] = mapped_column(
+        String(50),
+        default="FREE",
+        nullable=False,
+    )
+
+    subscription_status: Mapped[str] = mapped_column(
+        String(32),
+        default="FREE",
+        nullable=False,
+    )
+
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=datetime.utcnow,
@@ -174,13 +199,22 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+
     sessions: Mapped[list["UserSession"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
     )
+
     content_reports: Mapped[list["ContentReport"]] = relationship(
         cascade="all, delete-orphan",
         primaryjoin="User.firebase_uid == foreign(ContentReport.firebase_uid)",
+    )
+
+    # Link to payment ledger
+    payments: Mapped[list["PaymentTransaction"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        primaryjoin="User.firebase_uid == foreign(PaymentTransaction.firebase_uid)",
     )
 
 class UserQueryHistory(Base):
@@ -960,4 +994,81 @@ class PrelimsTrapMatrix(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False
+    )
+
+class PaymentTransaction(Base):
+    """Ledger table recording all Razorpay order lifecycles and payment verifications."""
+    __tablename__ = "payment_transactions"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    firebase_uid: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("users.firebase_uid", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    razorpay_order_id: Mapped[str] = mapped_column(
+        String(100),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
+    razorpay_payment_id: Mapped[str | None] = mapped_column(
+        String(100),
+        unique=True,
+        nullable=True,
+    )
+
+    razorpay_signature: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    amount_in_paise: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    currency: Mapped[str] = mapped_column(
+        String(10),
+        default="INR",
+        nullable=False,
+    )
+
+    tier_requested: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,  # e.g., 'PRO_MONTHLY', 'PRO_ANNUAL'
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="CREATED",
+        nullable=False,  # 'CREATED', 'SUCCESS', 'FAILED'
+    )
+
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="payments",
     )
