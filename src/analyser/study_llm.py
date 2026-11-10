@@ -50,13 +50,14 @@ You MUST strictly comply with these universal pedagogical & technical directives
 =========================================
 4. ANALYTICAL DEPTH & DIRECTIVES
 =========================================
-- Strategic UPSC Value: Deconstruct the exact GS-II syllabus intersection (e.g., executive discretion, federalism, welfare delivery, separation of powers).
+- why_it_matters: You MUST always provide this field. Deconstruct the exact GS-II significance, institutional mechanisms, and governance relevance.
+- upsc_relevance_mains: Direct mapping to UPSC GS Paper II syllabus keywords.
 - Mains Analytical Question: Draft an authentic 15-mark (250 words) question with explicit operational directives ('Critically evaluate', 'Examine', or 'Analyse').
 """
 
 
 class UPSCStudySynthesizer:
-    def __init__(self, model_name: str = "llama-3.3-70b-versatile", temperature: float = 0.15):
+    def __init__(self, model_name: str = "openai/gpt-oss-120b", temperature: float = 0.15):
         self.api_key = os.getenv("GROQ_API_KEY")
         if not self.api_key:
             raise ValueError("GROQ_API_KEY is not set.")

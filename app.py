@@ -26,6 +26,10 @@ from sqlalchemy import or_, select, func
 from sqlalchemy.orm import selectinload
 import time
 from src.cache import delete_cached_key, delete_cached_pattern
+import urllib.parse
+from fastapi.responses import StreamingResponse
+from src.services.pdf_generator import generate_pdf_from_markdown
+
 storage = MinIOStorage()
 
 retriever = UPSCRetriever()
@@ -1008,144 +1012,6 @@ def list_ca_notes(topic_path: str = Query(..., description="e.g. Election Commis
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/current-affairs/note-content")
-def get_ca_note_content(
-    response: Response,
-    object_key: str = Query(..., description="MinIO object key")
-):
-    """
-    Parses a PIB UPSC Smart Note from MinIO into clean, modular,
-    atomic JSON fields for custom FlutterFlow UI components.
-    """
-    start_time = time.perf_counter()
-    cache_key = f"ca:content:v4:{object_key}"
-    cached = get_cached_json(cache_key)
-
-    if cached:
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
-        response.headers["X-Cache"] = "HIT"
-        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
-        return cached
-
-    try:
-        raw_data = storage.get_json(object_key)
-
-        if not isinstance(raw_data, dict):
-            return {
-                "status": "error",
-                "message": "Invalid note format in storage",
-                "object_key": object_key
-            }
-
-        headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Study Note"
-
-        # Format publication date
-        meta_date = ""
-        raw_date = raw_data.get("generated_at")
-        if raw_date:
-            try:
-                dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
-                meta_date = dt.strftime("%d %B %Y")
-            except Exception:
-                meta_date = str(raw_date)
-
-        # 1. Summary & Context
-        summary_text = raw_data.get("summary", "").strip()
-        why_it_matters_text = raw_data.get("why_it_matters", "").strip()
-
-        # 2. Highlights (Separated into title + body objects)
-        raw_highlights = raw_data.get("smart_notes") or []
-        highlights_list = []
-        for idx, pt in enumerate(raw_highlights, start=1):
-            clean_pt = str(pt).strip().lstrip("•").lstrip("-").strip()
-            if ":" in clean_pt:
-                h_title, h_body = clean_pt.split(":", 1)
-                highlights_list.append({
-                    "title": h_title.strip(),
-                    "body": h_body.strip()
-                })
-            else:
-                highlights_list.append({
-                    "title": f"Key Point {idx}",
-                    "body": clean_pt
-                })
-
-        # 3. Backward Linkages (Separated into anchor + description)
-        raw_linkages = raw_data.get("backward_linkages") or []
-        linkages_list = []
-        for item in raw_linkages:
-            clean_item = str(item).replace("⚑", "—").strip().lstrip("•").lstrip("-").strip()
-            separator = "—" if "—" in clean_item else ("-" if "-" in clean_item else None)
-            
-            if separator and len(clean_item.split(separator)) == 2:
-                parts = clean_item.split(separator, 1)
-                linkages_list.append({
-                    "anchor": parts[0].strip(),
-                    "description": parts[1].strip()
-                })
-            else:
-                linkages_list.append({
-                    "anchor": clean_item,
-                    "description": "Constitutional Foundation / Statutory Linkage"
-                })
-
-        # 4. Prelims Drill (Separated statement cards)
-        raw_prelims = raw_data.get("prelims_practice_points") or []
-        drill_list = []
-        for idx, item in enumerate(raw_prelims, start=1):
-            if isinstance(item, dict):
-                is_corr = item.get("is_correct")
-                drill_list.append({
-                    "statement_number": idx,
-                    "statement": item.get("statement", "").strip(),
-                    "is_correct": is_corr,
-                    "verdict_label": "CORRECT" if is_corr is True else ("INCORRECT" if is_corr is False else "NEUTRAL"),
-                    "explanation": item.get("explanation", "").strip()
-                })
-            else:
-                drill_list.append({
-                    "statement_number": idx,
-                    "statement": str(item).strip(),
-                    "is_correct": None,
-                    "verdict_label": "INFO",
-                    "explanation": ""
-                })
-
-        # 5. Mains Analytical Question
-        mains_text = raw_data.get("mains_question", "").strip()
-
-        result_payload = {
-            "status": "success",
-            "title": headline,
-            "object_key": object_key,
-            "date": meta_date,
-            "upsc_relevance": raw_data.get("upsc_relevance_mains", ""),
-            "content": {
-                "summary": summary_text,
-                "why_it_matters": why_it_matters_text,
-                "highlights": highlights_list,
-                "linkages": linkages_list,
-                "drill": drill_list,
-                "mains": {
-                    "question": mains_text,
-                    "word_limit": "250 Words",
-                    "marks": "15 Marks"
-                }
-            }
-        }
-
-        set_cached_json(cache_key, result_payload, ex_seconds=604800)  # 7 days
-
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
-        response.headers["X-Cache"] = "MISS"
-        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
-        return result_payload
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/api/notes")
 async def get_user_notes(firebase_uid: str, db: Session = Depends(get_db)):
@@ -1265,185 +1131,6 @@ class SaveSmartNoteToWorkspaceRequest(BaseModel):
     object_key: str
     category: Optional[str] = "Current Affairs GS-II"
     custom_reflection: Optional[str] = None
-
-@app.post("/api/notes/save-smart-note")
-async def save_smart_note_to_workspace(
-    payload: SaveSmartNoteToWorkspaceRequest, 
-    db: Session = Depends(get_db)
-):
-    """
-    Imports a PIB Smart Note from MinIO directly into the user's personal UserNote list.
-    """
-    # 1. Verify user exists
-    user = db.query(User).filter(User.firebase_uid == payload.firebase_uid).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # 2. Fetch the smart note content from MinIO
-    try:
-        raw_data = storage.get_json(payload.object_key)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load smart note from storage: {e}")
-
-    headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Note"
-
-    # 3. Check if the user already saved this note (by title match)
-    existing = (
-        db.query(UserNote)
-        .filter(UserNote.user_id == user.id, UserNote.title == headline)
-        .first()
-    )
-    if existing:
-        return {
-            "status": "success",
-            "message": "Note already exists in your workspace",
-            "note_id": existing.id
-        }
-
-    # 4. Generate structured markdown note content
-    note_lines = [
-        f"# {headline}\n",
-        f"Source: PIB Reference | {payload.object_key}\n"
-    ]
-
-    if payload.custom_reflection:
-        note_lines.append(f"### 💡 My Revision Notes / Reflections\n{payload.custom_reflection}\n")
-
-    if raw_data.get("summary"):
-        note_lines.append(f"### 📌 Executive Summary\n{raw_data['summary']}\n")
-
-    smart_notes = raw_data.get("smart_notes")
-    if isinstance(smart_notes, list) and smart_notes:
-        note_lines.append("### 📝 Key Analysis & Takeaways")
-        for pt in smart_notes:
-            note_lines.append(f"* {pt}")
-        note_lines.append("")
-
-    linkages = raw_data.get("backward_linkages")
-    if isinstance(linkages, list) and linkages:
-        note_lines.append("### 🔗 Backward Linkages (Static Polity & Cases)")
-        for item in linkages:
-            note_lines.append(f"* {item}")
-        note_lines.append("")
-
-    if raw_data.get("mains_question"):
-        note_lines.append(f"### ✍️ Mains Analytical Question\n> {raw_data['mains_question']}\n")
-
-    formatted_content = "\n".join(note_lines)
-
-    # 5. Insert into existing UserNote table
-    new_note = UserNote(
-        user_id=user.id,
-        title=headline,
-        content=formatted_content,
-        category=payload.category or "Current Affairs GS-II",
-    )
-    db.add(new_note)
-    db.commit()
-    db.refresh(new_note)
-
-    return {
-        "status": "success",
-        "message": "Saved to personal workspace",
-        "note_id": new_note.id
-    }
-
-from fastapi.responses import StreamingResponse
-import urllib.parse
-from src.services.pdf_generator import generate_pdf_from_markdown
-
-@app.get("/api/current-affairs/download-pdf")
-async def download_smart_note_pdf(object_key: str = Query(..., description="MinIO object key")):
-    """
-    Generates and streams a print-calibrated, slate-and-brass PDF dossier 
-    directly from the MinIO smart note object.
-    """
-    try:
-        raw_data = storage.get_json(object_key)
-        if not isinstance(raw_data, dict):
-            raise HTTPException(status_code=404, detail="Note not found or invalid format in storage")
-
-        title = raw_data.get("headline") or raw_data.get("title") or "UPSC Current Affairs Dossier"
-        
-        # Build clean markdown specifically formatted for the new PDF engine
-        lines = [
-            f"# {title}\n",
-            "**UPSC Civil Services Examination • GS-II Intelligence Dossier**\n",
-            "---\n"
-        ]
-
-        # 1. Executive Summary
-        if raw_data.get("summary"):
-            lines.append("## Executive Summary\n")
-            lines.append(f"{raw_data['summary'].strip()}\n\n---\n")
-
-        # 2. Why It Matters
-        if raw_data.get("why_it_matters"):
-            lines.append("## Why It Matters for UPSC\n")
-            lines.append(f"> {raw_data['why_it_matters'].strip()}\n\n---\n")
-
-        # 3. Key Highlights
-        smart_notes = raw_data.get("smart_notes")
-        if isinstance(smart_notes, list) and smart_notes:
-            lines.append("## Strategic Takeaways & Key Facts\n")
-            for pt in smart_notes:
-                lines.append(f"* {str(pt).strip()}")
-            lines.append("\n---\n")
-
-        # 4. Backward Linkages / Constitutional Anchors
-        linkages = raw_data.get("backward_linkages")
-        if isinstance(linkages, list) and linkages:
-            lines.append("## Backward Linkages & Constitutional Anchors\n")
-            for item in linkages:
-                lines.append(f"* {str(item).strip()}")
-            lines.append("\n---\n")
-
-        # 5. Prelims Drill & Fact Checks
-        prelims = raw_data.get("prelims_practice_points")
-        if isinstance(prelims, list) and prelims:
-            lines.append("## Prelims Drill & Boundary Traps\n")
-            for idx, item in enumerate(prelims, start=1):
-                if isinstance(item, dict):
-                    stmt = item.get("statement", "").strip()
-                    correct = item.get("is_correct")
-                    exp = item.get("explanation", "").strip()
-                    badge = "**[CORRECT]**" if correct is True else ("**[INCORRECT]**" if correct is False else "")
-                    lines.append(f"**Statement {idx}:** {stmt}\n")
-                    if badge:
-                        lines.append(f"* Verdict: {badge}\n")
-                    if exp:
-                        lines.append(f"* Forensic Analysis: {exp}\n")
-                else:
-                    lines.append(f"* {str(item).strip()}")
-            lines.append("\n---\n")
-
-        # 6. Mains Analytical Question
-        if raw_data.get("mains_question"):
-            lines.append("## Mains Answer-Building Framework\n")
-            lines.append(f"> **Practice Question (250 Words | 15 Marks):**  \n> *{raw_data['mains_question'].strip()}*\n")
-
-        markdown_content = "\n".join(lines)
-
-        # Generate the styled PDF binary stream
-        pdf_stream = generate_pdf_from_markdown(title=title, markdown_content=markdown_content)
-
-        # URL-encode filename to support UTF-8 special characters safely
-        safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()
-        encoded_filename = urllib.parse.quote(f"{safe_title[:45]}.pdf")
-
-        return StreamingResponse(
-            pdf_stream,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}",
-                "Cache-Control": "no-cache, no-store, must-revalidate"
-            }
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 from fastapi import Response
 import xml.etree.ElementTree as ET
@@ -2378,6 +2065,394 @@ def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to persist smart note to R2: {str(e)}")
+
+# =====================================================================
+# 1. ATOMIC SMART NOTE CONTENT ENDPOINT (FLUTTERFLOW / WEB FRONTEND)
+# =====================================================================
+
+@app.get("/api/current-affairs/note-content")
+def get_ca_note_content(
+    response: Response,
+    object_key: str = Query(..., description="MinIO object key")
+):
+    """
+    Parses a PIB UPSC Smart Note from MinIO/R2 into clean, modular,
+    atomic JSON fields for custom FlutterFlow UI components.
+    """
+    start_time = time.perf_counter()
+    # Bumped cache namespace to v5 to instantly evict legacy string-polluted entries
+    cache_key = f"ca:content:v5:{object_key}"
+    cached = get_cached_json(cache_key)
+
+    if cached:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "HIT"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return cached
+
+    try:
+        raw_data = storage.get_json(object_key)
+
+        if not isinstance(raw_data, dict):
+            return {
+                "status": "error",
+                "message": "Invalid note format in storage",
+                "object_key": object_key
+            }
+
+        headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Study Note"
+
+        # Format publication date
+        meta_date = ""
+        raw_date = raw_data.get("generated_at")
+        if raw_date:
+            try:
+                dt = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                meta_date = dt.strftime("%d %B %Y")
+            except Exception:
+                meta_date = str(raw_date)
+
+        # 1. Summary & Context
+        summary_text = (raw_data.get("summary") or raw_data.get("pib_executive_context") or "").strip()
+        why_it_matters_text = (raw_data.get("why_it_matters") or raw_data.get("strategic_upsc_value") or "").strip()
+
+        # 2. Highlights / Smart Notes
+        raw_highlights = raw_data.get("smart_notes") or []
+        highlights_list = []
+        for idx, pt in enumerate(raw_highlights, start=1):
+            clean_pt = str(pt).strip().lstrip("•").lstrip("-").strip()
+            # Support both "Title: Body" format and pure directive sentences
+            title_part = ""
+            desc_part = clean_pt
+            for sep in [":", " – ", " — ", " - "]:
+                if sep in clean_pt:
+                    parts = clean_pt.split(sep, 1)
+                    title_part = parts[0].strip(" '\"")
+                    desc_part = parts[1].strip(" '\"")
+                    break
+
+            if not title_part:
+                title_part = f"Key Directive #{idx}"
+
+            highlights_list.append({
+                "title": title_part,
+                "body": desc_part
+            })
+
+        # 3. Backward Linkages (Robust Dict + String Handler)
+        raw_linkages = raw_data.get("backward_linkages") or []
+        linkages_list = []
+        for item in raw_linkages:
+            if isinstance(item, dict):
+                # Cleanly pull fields from modern R2 structured schema without stringifying dict
+                anchor_val = (
+                    item.get("title")
+                    or item.get("anchor")
+                    or item.get("article")
+                    or ""
+                ).strip()
+                desc_val = (
+                    item.get("description")
+                    or item.get("desc")
+                    or item.get("tagline")
+                    or "Constitutional Foundation / Statutory Linkage"
+                ).strip()
+                linkages_list.append({
+                    "anchor": anchor_val,
+                    "description": desc_val
+                })
+            else:
+                clean_item = str(item).replace("⚑", "—").strip().lstrip("•").lstrip("-").strip()
+                separator = None
+                for sep_candidate in ["—", "–", " - ", ":", "-"]:
+                    if sep_candidate in clean_item:
+                        separator = sep_candidate
+                        break
+
+                if separator:
+                    parts = clean_item.split(separator, 1)
+                    linkages_list.append({
+                        "anchor": parts[0].strip(" '\""),
+                        "description": parts[1].strip(" '\"")
+                    })
+                else:
+                    linkages_list.append({
+                        "anchor": clean_item,
+                        "description": "Constitutional Foundation / Statutory Linkage"
+                    })
+
+        # 4. Prelims Drill (Dual Schema: statement/explanation OR rule/trap)
+        raw_prelims = raw_data.get("prelims_practice_points") or []
+        drill_list = []
+        for idx, item in enumerate(raw_prelims, start=1):
+            if isinstance(item, dict):
+                stmt = (item.get("statement") or item.get("rule") or "").strip()
+                expl = (item.get("explanation") or "").strip()
+                trap_val = (item.get("trap") or "").strip()
+
+                is_corr = item.get("is_correct")
+                if is_corr is None and "rule" in item:
+                    is_corr = True
+
+                if not expl and trap_val:
+                    expl = f"Trap Distinction: {trap_val}"
+
+                drill_list.append({
+                    "statement_number": idx,
+                    "statement": stmt,
+                    "is_correct": is_corr,
+                    "verdict_label": "CORRECT" if is_corr is True else ("INCORRECT" if is_corr is False else "EXAM FACT"),
+                    "explanation": expl
+                })
+            else:
+                drill_list.append({
+                    "statement_number": idx,
+                    "statement": str(item).strip(),
+                    "is_correct": None,
+                    "verdict_label": "INFO",
+                    "explanation": ""
+                })
+
+        # 5. Mains Analytical Question
+        mains_text = (raw_data.get("mains_question") or raw_data.get("mains_analytical_question") or "").strip()
+
+        result_payload = {
+            "status": "success",
+            "title": headline,
+            "object_key": object_key,
+            "date": meta_date,
+            "upsc_relevance": raw_data.get("upsc_relevance_mains", ""),
+            "content": {
+                "summary": summary_text,
+                "why_it_matters": why_it_matters_text,
+                "highlights": highlights_list,
+                "linkages": linkages_list,
+                "drill": drill_list,
+                "mains": {
+                    "question": mains_text,
+                    "word_limit": "250 Words",
+                    "marks": "15 Marks"
+                }
+            }
+        }
+
+        set_cached_json(cache_key, result_payload, ex_seconds=604800)  # 7 days
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=604800, stale-while-revalidate=86400"
+        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Response-Time"] = f"{duration_ms:.2f}ms"
+        return result_payload
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
+# 2. SAVE SMART NOTE TO WORKSPACE ENDPOINT
+# =====================================================================
+
+@app.post("/api/notes/save-smart-note")
+async def save_smart_note_to_workspace(
+    payload: SaveSmartNoteToWorkspaceRequest, 
+    db: Session = Depends(get_db)
+):
+    """
+    Imports a PIB Smart Note from MinIO/R2 directly into the user's personal UserNote list.
+    """
+    user = db.query(User).filter(User.firebase_uid == payload.firebase_uid).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        raw_data = storage.get_json(payload.object_key)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load smart note from storage: {e}")
+
+    headline = raw_data.get("headline") or raw_data.get("title") or "PIB Smart Note"
+
+    # Deduplication check
+    existing = (
+        db.query(UserNote)
+        .filter(UserNote.user_id == user.id, UserNote.title == headline)
+        .first()
+    )
+    if existing:
+        return {
+            "status": "success",
+            "message": "Note already exists in your workspace",
+            "note_id": existing.id
+        }
+
+    # Generate structured markdown note
+    note_lines = [
+        f"# {headline}\n",
+        f"Source: PIB Reference | {payload.object_key}\n"
+    ]
+
+    if payload.custom_reflection:
+        note_lines.append(f"### 💡 My Revision Notes / Reflections\n{payload.custom_reflection}\n")
+
+    summary_val = raw_data.get("summary") or raw_data.get("pib_executive_context")
+    if summary_val:
+        note_lines.append(f"### 📌 Executive Summary\n{summary_val.strip()}\n")
+
+    why_val = raw_data.get("why_it_matters") or raw_data.get("strategic_upsc_value")
+    if why_val:
+        note_lines.append(f"### 🎯 Strategic UPSC Value\n{why_val.strip()}\n")
+
+    smart_notes = raw_data.get("smart_notes")
+    if isinstance(smart_notes, list) and smart_notes:
+        note_lines.append("### 📝 Key Analysis & Takeaways")
+        for pt in smart_notes:
+            note_lines.append(f"* {str(pt).strip()}")
+        note_lines.append("")
+
+    linkages = raw_data.get("backward_linkages")
+    if isinstance(linkages, list) and linkages:
+        note_lines.append("### 🔗 Backward Linkages (Static Polity & Cases)")
+        for item in linkages:
+            if isinstance(item, dict):
+                t = item.get("title") or item.get("anchor") or ""
+                d = item.get("description") or item.get("desc") or ""
+                line = f"{t} – {d}" if t and d else (t or d)
+            else:
+                line = str(item).strip()
+            note_lines.append(f"* {line}")
+        note_lines.append("")
+
+    mains_val = raw_data.get("mains_question") or raw_data.get("mains_analytical_question")
+    if mains_val:
+        note_lines.append(f"### ✍️ Mains Analytical Question\n> {mains_val.strip()}\n")
+
+    formatted_content = "\n".join(note_lines)
+
+    new_note = UserNote(
+        user_id=user.id,
+        title=headline,
+        content=formatted_content,
+        category=payload.category or "Current Affairs GS-II",
+    )
+    db.add(new_note)
+    db.commit()
+    db.refresh(new_note)
+
+    return {
+        "status": "success",
+        "message": "Saved to personal workspace",
+        "note_id": new_note.id
+    }
+
+
+# =====================================================================
+# 3. DOWNLOAD PDF DOSSIER ENDPOINT
+# =====================================================================
+
+@app.get("/api/current-affairs/download-pdf")
+async def download_smart_note_pdf(object_key: str = Query(..., description="MinIO object key")):
+    """
+    Generates and streams a print-calibrated, slate-and-brass PDF dossier 
+    directly from the MinIO smart note object.
+    """
+    try:
+        raw_data = storage.get_json(object_key)
+        if not isinstance(raw_data, dict):
+            raise HTTPException(status_code=404, detail="Note not found or invalid format in storage")
+
+        title = raw_data.get("headline") or raw_data.get("title") or "UPSC Current Affairs Dossier"
+        
+        lines = [
+            f"# {title}\n",
+            "**UPSC Civil Services Examination • GS-II Intelligence Dossier**\n",
+            "---\n"
+        ]
+
+        # 1. Executive Summary
+        summary_val = raw_data.get("summary") or raw_data.get("pib_executive_context")
+        if summary_val:
+            lines.append("## Executive Summary\n")
+            lines.append(f"{summary_val.strip()}\n\n---\n")
+
+        # 2. Why It Matters
+        why_val = raw_data.get("why_it_matters") or raw_data.get("strategic_upsc_value")
+        if why_val:
+            lines.append("## Why It Matters for UPSC\n")
+            lines.append(f"> {why_val.strip()}\n\n---\n")
+
+        # 3. Key Highlights
+        smart_notes = raw_data.get("smart_notes")
+        if isinstance(smart_notes, list) and smart_notes:
+            lines.append("## Strategic Takeaways & Key Facts\n")
+            for pt in smart_notes:
+                lines.append(f"* {str(pt).strip()}")
+            lines.append("\n---\n")
+
+        # 4. Backward Linkages / Constitutional Anchors (Clean formatting for dict & str)
+        linkages = raw_data.get("backward_linkages")
+        if isinstance(linkages, list) and linkages:
+            lines.append("## Backward Linkages & Constitutional Anchors\n")
+            for item in linkages:
+                if isinstance(item, dict):
+                    t = item.get("title") or item.get("anchor") or ""
+                    d = item.get("description") or item.get("desc") or ""
+                    line = f"{t} – {d}" if t and d else (t or d)
+                else:
+                    line = str(item).strip()
+                lines.append(f"* {line}")
+            lines.append("\n---\n")
+
+        # 5. Prelims Drill & Fact Checks
+        prelims = raw_data.get("prelims_practice_points")
+        if isinstance(prelims, list) and prelims:
+            lines.append("## Prelims Drill & Boundary Traps\n")
+            for idx, item in enumerate(prelims, start=1):
+                if isinstance(item, dict):
+                    stmt = (item.get("statement") or item.get("rule") or "").strip()
+                    correct = item.get("is_correct")
+                    if correct is None and "rule" in item:
+                        correct = True
+                    exp = (item.get("explanation") or "").strip()
+                    trap = (item.get("trap") or "").strip()
+
+                    badge = "**[CORRECT]**" if correct is True else ("**[INCORRECT]**" if correct is False else "")
+                    lines.append(f"**Statement {idx}:** {stmt}\n")
+                    if badge:
+                        lines.append(f"* Verdict: {badge}\n")
+                    if exp:
+                        lines.append(f"* Forensic Analysis: {exp}\n")
+                    if trap:
+                        lines.append(f"* Distractor Trap: {trap}\n")
+                else:
+                    lines.append(f"* {str(item).strip()}")
+            lines.append("\n---\n")
+
+        # 6. Mains Analytical Question
+        mains_val = raw_data.get("mains_question") or raw_data.get("mains_analytical_question")
+        if mains_val:
+            lines.append("## Mains Answer-Building Framework\n")
+            lines.append(f"> **Practice Question (250 Words | 15 Marks):**  \n> *{mains_val.strip()}*\n")
+
+        markdown_content = "\n".join(lines)
+
+        pdf_stream = generate_pdf_from_markdown(title=title, markdown_content=markdown_content)
+
+        safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "_", "-")).strip()
+        encoded_filename = urllib.parse.quote(f"{safe_title[:45]}.pdf")
+
+        return StreamingResponse(
+            pdf_stream,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename*=utf-8''{encoded_filename}",
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
