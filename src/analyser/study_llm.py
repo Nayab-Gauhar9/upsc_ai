@@ -41,8 +41,8 @@ You MUST strictly comply with these universal pedagogical & technical directives
 3. BACKWARD LINKAGES & DOCTRINAL ANCHORS (SLIDE 4 SCHEMA)
 =========================================
 - Provide EXACTLY 6 balanced, high-yield anchors (3 rows x 2 columns) to maintain visual grid symmetry.
-- Every anchor MUST populate BOTH:
-  * `title`: A concise, high-impact header (Max 4-5 words, e.g., "Article 51 (DPSP)", "Article 15(4)", "Seventh Schedule (List I)"). NEVER leave title blank or empty.
+- Every anchor in `backward_linkages` MUST be an object with BOTH fields populated:
+  * `title`: A concise header (Max 4-5 words, e.g., "Article 51 (DPSP)", "Article 15(4)", "Seventh Schedule (List I)"). NEVER leave title blank or empty.
   * `description`: A crisp 1-sentence doctrinal deconstruction (Max 15 words).
 - If the subject touches International Relations / War / Treaties:
   You MUST include Article 51 (DPSP: Promotion of International Peace and Security) and Seventh Schedule Entries (Entry 10 & 14 of the Union List).
@@ -68,7 +68,7 @@ class UPSCStudySynthesizer:
             temperature=temperature,
             max_tokens=4096,
         )
-        # Guarantees complete schema backward compatibility with your existing endpoints and R2 JSONs
+        # Binds the Pydantic schema so Groq registers backward_linkages as an array of objects
         self.structured_llm = self.llm.with_structured_output(StudyIntelligenceResult)
 
         self.prompt = ChatPromptTemplate.from_messages([
@@ -102,7 +102,6 @@ class UPSCStudySynthesizer:
         if clean_chapter in CHAPTER_BY_TITLE:
             validated_chapter = clean_chapter
         else:
-            # Fallback if an integer string or legacy key was supplied
             try:
                 ch_num = int(clean_chapter.split()[0].replace("Chapter", "").strip())
                 if is_valid_chapter(ch_num):

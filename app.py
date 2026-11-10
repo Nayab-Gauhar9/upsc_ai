@@ -1870,21 +1870,6 @@ def admin_login(payload: AdminLoginRequest):
         "token": ADMIN_SECRET_KEY
     }
 
-class AdminSmartNoteUpdateRequest(BaseModel):
-    object_key: str
-    headline: Optional[str] = None
-    sub_headline: Optional[str] = None
-    pib_executive_context: Optional[str] = None
-    strategic_upsc_value: Optional[str] = None
-    summary: Optional[str] = None
-    why_it_matters: Optional[str] = None
-    smart_notes: Optional[list] = None
-    backward_linkages: Optional[list] = None
-    prelims_practice_points: Optional[list] = None
-    mains_question: Optional[str] = None
-    mains_analytical_question: Optional[str] = None
-    raw_json_override: Optional[dict] = None
-    re_render_slides: Optional[bool] = False
 
 # ---------------------------------------------------------
 # Admin Smart Notes Studio & R2 Quality Cockpit Endpoints
@@ -1969,13 +1954,41 @@ def list_admin_smart_notes_queue(
 def get_admin_smart_note_detail(
     object_key: str = Query(..., description="MinIO/R2 object key e.g. pib/smart_notes/..."),
 ):
-    """
-    Loads verbatim smart note JSON data directly from R2 to populate the studio editor.
-    """
     try:
         data = storage.get_json(object_key)
         if not isinstance(data, dict):
             raise HTTPException(status_code=404, detail="Smart note not found or corrupt in storage")
+
+        # Normalize prelims items so frontend gets explicit statement, rule, trap, and is_correct
+        raw_prelims = data.get("prelims_practice_points") or []
+        normalized_prelims = []
+        for p in raw_prelims:
+            if isinstance(p, dict):
+                stmt = p.get("statement") or p.get("rule") or ""
+                expl = p.get("explanation") or p.get("trap") or ""
+                # Default is_correct: check bool, or inspect rule heuristic
+                is_corr = p.get("is_correct")
+                if is_corr is None:
+                    # If it was saved with 'rule' vs 'trap', the statement itself was usually False (a trap) or True
+                    is_corr = False if p.get("trap") else True
+
+                normalized_prelims.append({
+                    "statement": stmt,
+                    "rule": stmt,
+                    "explanation": expl,
+                    "trap": expl,
+                    "is_correct": bool(is_corr)
+                })
+            else:
+                normalized_prelims.append({
+                    "statement": str(p),
+                    "rule": str(p),
+                    "explanation": "",
+                    "trap": "",
+                    "is_correct": True
+                })
+
+        data["prelims_practice_points"] = normalized_prelims
 
         parts = object_key.split("/")
         return {
@@ -1991,14 +2004,31 @@ def get_admin_smart_note_detail(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class AdminSmartNoteUpdateRequest(BaseModel):
+    object_key: str
+    headline: Optional[str] = None
+    sub_headline: Optional[str] = None
+    pib_executive_context: Optional[str] = None
+    strategic_upsc_value: Optional[str] = None
+    summary: Optional[str] = None
+    why_it_matters: Optional[str] = None
+    smart_notes: Optional[list] = None
+    backward_linkages: Optional[list] = None
+    prelims_practice_points: Optional[list] = None
+    mains_question: Optional[str] = None
+    mains_analytical_question: Optional[str] = None
+    raw_json_override: Optional[dict] = None
+    re_render_slides: Optional[bool] = False
+
 import io
 import json
 
 @app.put("/api/admin/smart-notes/save")
 def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
     """
-    Overwrites the amended smart note JSON in MinIO/R2 and clears
-    all downstream Redis caches so changes take effect immediately on web & app.
+    Overwrites the amended smart note JSON in MinIO/R2, harmonizes both
+    legacy (rule/trap) and modern (statement/is_correct/explanation) fields,
+    and flushes all downstream Redis caches (including ca:content:v5).
     """
     try:
         # 1. Fetch current object from R2 safely
@@ -2015,28 +2045,89 @@ def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
             updated_data = payload.raw_json_override
         else:
             updated_data = dict(current_data)
-            field_mappings = {
-                "headline": payload.headline,
-                "title": payload.headline,
-                "sub_headline": payload.sub_headline,
-                "pib_executive_context": payload.pib_executive_context,
-                "strategic_upsc_value": payload.strategic_upsc_value,
-                "summary": payload.summary or payload.pib_executive_context,
-                "why_it_matters": payload.why_it_matters or payload.strategic_upsc_value,
-                "smart_notes": payload.smart_notes,
-                "backward_linkages": payload.backward_linkages,
-                "prelims_practice_points": payload.prelims_practice_points,
-                "mains_question": payload.mains_question or payload.mains_analytical_question,
-                "mains_analytical_question": payload.mains_analytical_question or payload.mains_question,
-            }
 
-            for key, val in field_mappings.items():
-                if val is not None:
-                    updated_data[key] = val
+            # Direct scalar & text synchronizations
+            if payload.headline is not None:
+                updated_data["headline"] = payload.headline.strip()
+                updated_data["title"] = payload.headline.strip()
 
+            if payload.sub_headline is not None:
+                updated_data["sub_headline"] = payload.sub_headline.strip()
+
+            if payload.summary is not None or payload.pib_executive_context is not None:
+                val = (payload.summary or payload.pib_executive_context or "").strip()
+                updated_data["summary"] = val
+                updated_data["pib_executive_context"] = val
+
+            if payload.why_it_matters is not None or payload.strategic_upsc_value is not None:
+                val = (payload.why_it_matters or payload.strategic_upsc_value or "").strip()
+                updated_data["why_it_matters"] = val
+                updated_data["strategic_upsc_value"] = val
+
+            if payload.smart_notes is not None:
+                updated_data["smart_notes"] = [
+                    str(pt).strip() for pt in payload.smart_notes if str(pt).strip()
+                ]
+
+            # 3. Synchronize Backward Linkages (Ensure both 'title' and 'anchor' exist)
+            if payload.backward_linkages is not None:
+                cleaned_linkages = []
+                for item in payload.backward_linkages:
+                    if isinstance(item, dict):
+                        t = (item.get("title") or item.get("anchor") or "").strip()
+                        d = (item.get("description") or item.get("desc") or "").strip()
+                        cleaned_linkages.append({
+                            "title": t,
+                            "anchor": t,
+                            "description": d
+                        })
+                    elif isinstance(item, str):
+                        parts = [p.strip() for p in item.split(":", 1)]
+                        if len(parts) == 2:
+                            cleaned_linkages.append({"title": parts[0], "anchor": parts[0], "description": parts[1]})
+                        else:
+                            cleaned_linkages.append({"title": item.strip(), "anchor": item.strip(), "description": ""})
+                updated_data["backward_linkages"] = cleaned_linkages
+
+            # 4. Synchronize Prelims Drill Points (Enforce explicit boolean `is_correct`)
+            if payload.prelims_practice_points is not None:
+                cleaned_prelims = []
+                for item in payload.prelims_practice_points:
+                    if isinstance(item, dict):
+                        stmt = (item.get("statement") or item.get("rule") or "").strip()
+                        expl = (item.get("explanation") or item.get("trap") or "").strip()
+                        
+                        # Preserve explicit boolean from frontend toggle, defaulting to False if marked as trap
+                        is_corr = item.get("is_correct")
+                        if is_corr is None:
+                            is_corr = False if item.get("trap") else True
+
+                        cleaned_prelims.append({
+                            "statement": stmt,
+                            "rule": stmt,
+                            "is_correct": bool(is_corr),
+                            "explanation": expl,
+                            "trap": expl
+                        })
+                    else:
+                        cleaned_prelims.append({
+                            "statement": str(item).strip(),
+                            "rule": str(item).strip(),
+                            "is_correct": True,
+                            "explanation": "",
+                            "trap": ""
+                        })
+                updated_data["prelims_practice_points"] = cleaned_prelims
+
+            if payload.mains_question is not None or payload.mains_analytical_question is not None:
+                m_val = (payload.mains_analytical_question or payload.mains_question or "").strip()
+                updated_data["mains_question"] = m_val
+                updated_data["mains_analytical_question"] = m_val
+
+        # Timestamp audit
         updated_data["last_manually_edited_at"] = datetime.utcnow().isoformat()
 
-        # 3. Direct R2 / MinIO Byte Stream Upload
+        # 5. Direct R2 / MinIO Byte Stream Upload
         json_bytes = json.dumps(updated_data, ensure_ascii=False, indent=2).encode("utf-8")
         data_stream = io.BytesIO(json_bytes)
 
@@ -2053,14 +2144,15 @@ def save_amended_smart_note(payload: AdminSmartNoteUpdateRequest):
         else:
             raise AttributeError("Unable to locate S3 upload client on MinIOStorage instance")
 
-        # 4. Invalidate Redis Caches
+        # 6. Flush all relevant Redis cache keys
+        delete_cached_key(f"ca:content:v5:{payload.object_key}")
         delete_cached_key(f"ca:content:v4:{payload.object_key}")
         delete_cached_key("ca:notes:latest")
         delete_cached_pattern("ca:notes:*")
 
         return {
             "status": "success",
-            "message": "Smart Note successfully amended in R2 and cache cleared",
+            "message": "Smart Note successfully amended in R2 and all caches purged",
             "object_key": payload.object_key,
         }
     except Exception as e:
